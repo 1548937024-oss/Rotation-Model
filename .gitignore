@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+.venv.bak/
+.venv-build/
+
+# Build outputs
+build/
+dist/
+release/
+
+# App runtime artifacts
+output/
+tmp/
+*.log
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
