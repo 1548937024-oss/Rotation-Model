@@ -58,6 +58,42 @@ class WorkerEndToEndTests(unittest.TestCase):
         self.assertTrue(motion.enabled)
         self.assertEqual(motion.actual_speed, 30)
 
+    def test_cyclic_catch_up_after_blocking(self) -> None:
+        class RecordingTransport:
+            def __init__(self) -> None:
+                self.writes: list[bytes] = []
+                self.is_open = True
+
+            def write(self, data: bytes) -> int:
+                self.writes.append(bytes(data))
+                return len(data)
+
+            def read(self, size: int = 1) -> bytes:
+                return b""
+
+            def reset_input_buffer(self) -> None:
+                return None
+
+            def close(self) -> None:
+                self.is_open = False
+
+        worker = DeviceWorker()
+        try:
+            transport = RecordingTransport()
+            worker.transport = transport
+            worker.control_nodes = (1,)
+            worker.byteorder = "little"
+            worker.latest_control = MotorControl(True, 0, 100, 10, 5)
+            worker.cyclic_enabled = True
+            worker.cyclic_interval = 0.02
+            now = time.monotonic()
+            worker._next_control = now - 0.1
+            worker._flush_due_controls(now)
+            self.assertGreaterEqual(len(transport.writes), 5)
+            self.assertGreater(worker._next_control, now)
+        finally:
+            worker.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

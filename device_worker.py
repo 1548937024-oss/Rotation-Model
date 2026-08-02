@@ -70,7 +70,7 @@ class DeviceWorker:
 
     def _read_exact(self, size: int) -> bytes:
         result = bytearray()
-        deadline = time.monotonic() + 0.25
+        deadline = time.monotonic() + 0.05
         while len(result) < size and time.monotonic() < deadline:
             chunk = self.transport.read(size - len(result))
             if chunk:
@@ -123,6 +123,19 @@ class DeviceWorker:
         else:
             frame = build_group_control_frame(selected, control, self.byteorder)
             self._write(frame, f"{note}（多控 {len(selected)} 节点）")
+
+    def _flush_due_controls(self, now: float) -> None:
+        """Emit one control per elapsed cycle so polling cannot starve it."""
+
+        if not self.cyclic_enabled:
+            return
+        burst = 0
+        while self.cyclic_enabled and now >= self._next_control and burst < 10:
+            self._send_control(self.latest_control, "周期单控")
+            self._next_control += self.cyclic_interval
+            burst += 1
+        if now >= self._next_control:
+            self._next_control = now + self.cyclic_interval
 
     def _service(self, payload: bytes, note: str = "服务请求") -> Any:
         request_mid = 0x600 + self.node_id
@@ -311,13 +324,12 @@ class DeviceWorker:
             if self.transport is None:
                 continue
             now = time.monotonic()
-            if self.cyclic_enabled and now >= self._next_control:
+            if self.cyclic_enabled:
                 try:
-                    self._send_control(self.latest_control, "周期单控")
+                    self._flush_due_controls(now)
                 except Exception as exc:
                     self.cyclic_enabled = False
                     self._emit("error", f"周期控制停止：{exc}")
-                self._next_control = now + self.cyclic_interval
             if self.poll_enabled and now >= self._next_poll:
                 try:
                     self._poll_once()
