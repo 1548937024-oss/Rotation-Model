@@ -11,6 +11,7 @@ from app import (
     MotorHostApp,
     clamp_control_value,
 )
+from motor_protocol import ProtocolError
 
 
 class ControlUiTests(unittest.TestCase):
@@ -41,6 +42,14 @@ class ControlUiTests(unittest.TestCase):
         value = MotorHostApp._clamp_control_variable(variable, *POSITION_LIMITS)
         self.assertEqual(value, 65535)
         self.assertEqual(variable.get(), "65535")
+
+    def test_contiguous_node_selection_rule(self) -> None:
+        self.assertEqual(MotorHostApp._check_contiguous_nodes((1,)), (1,))
+        self.assertEqual(MotorHostApp._check_contiguous_nodes((1, 2, 3)), (1, 2, 3))
+        with self.assertRaises(ProtocolError):
+            MotorHostApp._check_contiguous_nodes((1, 3))
+        with self.assertRaises(ProtocolError):
+            MotorHostApp._check_contiguous_nodes((2, 3))
 
 
 if __name__ == "__main__":

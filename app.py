@@ -501,6 +501,17 @@ class MotorHostApp(tk.Tk):
         return nodes if nodes else (self._validate_node(),)
 
     @staticmethod
+    def _check_contiguous_nodes(nodes: tuple[int, ...]) -> tuple[int, ...]:
+        if len(nodes) > 1:
+            expected = tuple(range(1, max(nodes) + 1))
+            if nodes != expected:
+                raise ProtocolError("多节点控制需从 Node 1 开始连续勾选（如 1、2、3）")
+        return nodes
+
+    def _validate_selected_nodes(self) -> tuple[int, ...]:
+        return self._check_contiguous_nodes(self._selected_nodes())
+
+    @staticmethod
     def _clamp_control_variable(variable: tk.Variable, low: int, high: int) -> int:
         try:
             value = clamp_control_value(variable.get(), low, high)
@@ -570,11 +581,12 @@ class MotorHostApp(tk.Tk):
         try:
             control = self._control_value()
             control.pack()
+            nodes = self._validate_selected_nodes()
         except (ValueError, tk.TclError, ProtocolError) as exc:
             messagebox.showerror("控制参数错误", str(exc))
             return
         if self._confirm_enable(control.enable):
-            self.worker.submit("send_control", control, self._selected_nodes())
+            self.worker.submit("send_control", control, nodes)
 
     def _emergency_disable(self) -> None:
         if not self._require_connected():
@@ -591,6 +603,7 @@ class MotorHostApp(tk.Tk):
             control = self._control_value()
             interval = int(self.cyclic_ms_var.get())
             control.pack()
+            nodes = self._validate_selected_nodes()
             if not 10 <= interval <= 1000:
                 raise ProtocolError("周期必须为 10~1000 ms")
         except (ValueError, tk.TclError, ProtocolError) as exc:
@@ -605,7 +618,7 @@ class MotorHostApp(tk.Tk):
             control,
             self.cyclic_var.get(),
             interval / 1000,
-            self._selected_nodes(),
+            nodes,
         )
 
     def _configure_poll(self) -> None:

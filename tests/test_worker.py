@@ -94,6 +94,90 @@ class WorkerEndToEndTests(unittest.TestCase):
         finally:
             worker.shutdown()
 
+    def test_poll_continues_when_one_node_times_out(self) -> None:
+        from motor_protocol import build_reply_tail
+
+        class NodeOneTransport:
+            def __init__(self) -> None:
+                self._rx = bytearray()
+                self.is_open = True
+
+            def write(self, data: bytes) -> int:
+                if len(data) == 3 and data[0] == 0xAA:
+                    mid = int.from_bytes(data[1:3], "little")
+                    if mid == 0x181:
+                        self._rx.extend(build_reply_tail(mid, bytes.fromhex("80 00 00 00 00")))
+                    elif mid == 0x281:
+                        self._rx.extend(build_reply_tail(mid, bytes.fromhex("C0 5D 1F")))
+                return len(data)
+
+            def read(self, size: int = 1) -> bytes:
+                out = bytes(self._rx[:size])
+                del self._rx[:size]
+                return out
+
+            def reset_input_buffer(self) -> None:
+                self._rx.clear()
+
+            def close(self) -> None:
+                self.is_open = False
+
+        worker = DeviceWorker()
+        try:
+            worker.transport = NodeOneTransport()
+            worker.control_nodes = (1, 2)
+            worker.byteorder = "little"
+            worker.node_id = 1
+            worker._poll_once()
+            events = []
+            while True:
+                try:
+                    events.append(worker.events.get_nowait())
+                except queue.Empty:
+                    break
+            motions = [payload for kind, payload in events if kind == "multi_motion"]
+            self.assertTrue(any(node == 1 for node, _ in motions))
+        finally:
+            worker.shutdown()
+
+    def test_transport_error_marks_disconnected(self) -> None:
+        class BrokenTransport:
+            def __init__(self) -> None:
+                self.is_open = True
+
+            def write(self, data: bytes) -> int:
+                raise OSError("device removed")
+
+            def read(self, size: int = 1) -> bytes:
+                return b""
+
+            def reset_input_buffer(self) -> None:
+                return None
+
+            def close(self) -> None:
+                self.is_open = False
+
+        worker = DeviceWorker()
+        try:
+            worker.transport = BrokenTransport()
+            worker.control_nodes = (1,)
+            worker.byteorder = "little"
+            worker.submit("send_control", MotorControl(False, 0, 0, 0, 0), (1,))
+            deadline = time.monotonic() + 1.0
+            disconnected = False
+            while time.monotonic() < deadline:
+                try:
+                    kind, _ = worker.events.get(timeout=0.05)
+                except queue.Empty:
+                    continue
+                if kind == "disconnected":
+                    disconnected = True
+                    break
+            self.assertTrue(disconnected)
+            self.assertIsNone(worker.transport)
+        finally:
+            worker.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

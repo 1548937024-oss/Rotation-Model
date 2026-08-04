@@ -150,17 +150,20 @@ class DeviceWorker:
     def _poll_once(self) -> None:
         self._poll_count += 1
         for node in self.control_nodes:
-            motion_data = self._query(0x180 + node, f"查询节点 {node} 运动状态")
-            motion = parse_motion_status(motion_data)
-            self._emit("multi_motion", (node, motion))
-            if node == self.node_id:
-                self._emit("motion_status", motion)
-            if self._poll_count % 5 == 0:
-                device_data = self._query(0x280 + node, f"查询节点 {node} 设备状态")
-                device = parse_device_status(device_data)
-                self._emit("multi_device", (node, device))
+            try:
+                motion_data = self._query(0x180 + node, f"查询节点 {node} 运动状态")
+                motion = parse_motion_status(motion_data)
+                self._emit("multi_motion", (node, motion))
                 if node == self.node_id:
-                    self._emit("device_status", device)
+                    self._emit("motion_status", motion)
+                if self._poll_count % 5 == 0:
+                    device_data = self._query(0x280 + node, f"查询节点 {node} 设备状态")
+                    device = parse_device_status(device_data)
+                    self._emit("multi_device", (node, device))
+                    if node == self.node_id:
+                        self._emit("device_status", device)
+            except Exception as exc:
+                self._emit("warning", f"节点 {node} 查询失败：{exc}")
 
     def _connect(self, port: str, baudrate: int, byteorder: str, node_id: int) -> None:
         if self.transport is not None:
@@ -206,6 +209,19 @@ class DeviceWorker:
         finally:
             self.transport = None
             self._emit("disconnected", None)
+
+    def _handle_transport_error(self, exc: Exception) -> None:
+        if isinstance(exc, TimeoutError):
+            return
+        if isinstance(exc, OSError) or exc.__class__.__name__ == "SerialException":
+            try:
+                self._disconnect(False)
+            except Exception:
+                self.transport = None
+                self.poll_enabled = False
+                self.cyclic_enabled = False
+                self._emit("disconnected", None)
+            self._emit("warning", f"串口连接异常，已断开，请手动重连：{exc}")
 
     def _handle(self, command: WorkerCommand) -> None:
         name, args = command.name, command.args
@@ -321,6 +337,7 @@ class DeviceWorker:
                     self._handle(command)
                 except Exception as exc:
                     self._emit("error", f"{command.name} 失败：{exc}")
+                    self._handle_transport_error(exc)
             if self.transport is None:
                 continue
             now = time.monotonic()
@@ -330,9 +347,11 @@ class DeviceWorker:
                 except Exception as exc:
                     self.cyclic_enabled = False
                     self._emit("error", f"周期控制停止：{exc}")
+                    self._handle_transport_error(exc)
             if self.poll_enabled and now >= self._next_poll:
                 try:
                     self._poll_once()
                 except Exception as exc:
                     self._emit("warning", f"状态查询失败：{exc}")
+                    self._handle_transport_error(exc)
                 self._next_poll = time.monotonic() + self.poll_interval
