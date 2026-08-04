@@ -51,6 +51,29 @@ class ControlUiTests(unittest.TestCase):
         with self.assertRaises(ProtocolError):
             MotorHostApp._check_contiguous_nodes((2, 3))
 
+    def test_multi_active_nodes_are_contiguous_from_node_one(self) -> None:
+        class VariableStub:
+            def __init__(self, value: bool) -> None:
+                self.value = value
+
+            def get(self) -> bool:
+                return self.value
+
+        class MultiTabStub:
+            mn_active_vars = [VariableStub(i == 0) for i in range(5)]
+
+            _multi_nodes = MotorHostApp._multi_nodes
+            _check_contiguous_nodes = staticmethod(MotorHostApp._check_contiguous_nodes)
+
+        stub = MultiTabStub()
+        self.assertEqual(stub._multi_nodes(), (1,))
+        stub.mn_active_vars[1].value = True
+        stub.mn_active_vars[2].value = True
+        self.assertEqual(stub._multi_nodes(), (1, 2, 3))
+        stub.mn_active_vars[1].value = False
+        with self.assertRaises(ProtocolError):
+            stub._multi_nodes()
+
 
 if __name__ == "__main__":
     unittest.main()

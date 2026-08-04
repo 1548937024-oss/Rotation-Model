@@ -191,22 +191,37 @@ def build_group_control_frame(
     control: MotorControl,
     byteorder: str = "little",
 ) -> bytes:
-    """Build MSG_GroupControl1 (0x200) with one MCP slot per node position."""
+    """Build MSG_GroupControl1 (0x200) with the same control for every node."""
 
     if not nodes:
         raise ProtocolError("多控报文至少需要一个 Node ID")
-    node_set = set(int(node) for node in nodes)
+    return build_multi_control_frame({int(node): control for node in nodes}, byteorder)
+
+
+def build_multi_control_frame(
+    controls: dict[int, MotorControl],
+    byteorder: str = "little",
+) -> bytes:
+    """Build MSG_GroupControl1 (0x200) with one MCP slot per node.
+
+    Each node receives its own MotorControl so a single group frame can carry
+    independent target position/speed/Iq per module.
+    """
+
+    if not controls:
+        raise ProtocolError("多控报文至少需要一个节点")
+    node_set = {int(node) for node in controls}
     if len(node_set) > MAX_GROUP_MCP_COUNT:
         raise ProtocolError(f"多控报文最多支持 {MAX_GROUP_MCP_COUNT} 个节点")
-    if not node_set or any(not 1 <= node <= MAX_GROUP_MCP_COUNT for node in node_set):
+    if any(not 1 <= node <= MAX_GROUP_MCP_COUNT for node in node_set):
         raise ProtocolError(f"多控节点 ID 必须位于 1~{MAX_GROUP_MCP_COUNT}")
 
     max_node = max(node_set)
-    packed = control.pack()
     idle = MotorControl(False, 0, 0, 0, 0).pack()
     data = bytearray()
     for node in range(1, max_node + 1):
-        data.extend(packed if node in node_set else idle)
+        control = controls.get(node)
+        data.extend(control.pack() if control is not None else idle)
     return build_frame(0x200, bytes(data), byteorder)
 
 

@@ -1,7 +1,7 @@
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 1, 0, 0),
-    prodvers=(1, 1, 0, 0),
+    filevers=(1, 0, 2, 0),
+    prodvers=(1, 0, 2, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -16,12 +16,12 @@ VSVersionInfo(
         [
           StringStruct(u'CompanyName', u''),
           StringStruct(u'FileDescription', u'电机模组串口上位机'),
-          StringStruct(u'FileVersion', u'1.1.0'),
+          StringStruct(u'FileVersion', u'1.0.2'),
           StringStruct(u'InternalName', u'MotorModuleHost'),
           StringStruct(u'LegalCopyright', u''),
           StringStruct(u'OriginalFilename', u'电机模组上位机.exe'),
           StringStruct(u'ProductName', u'电机模组串口上位机'),
-          StringStruct(u'ProductVersion', u'1.1.0')
+          StringStruct(u'ProductVersion', u'1.0.2')
         ]
       )
     ]),

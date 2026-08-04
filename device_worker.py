@@ -14,6 +14,7 @@ from motor_protocol import (
     ProtocolError,
     build_frame,
     build_group_control_frame,
+    build_multi_control_frame,
     build_query,
     build_single_control_frame,
     format_hex,
@@ -51,6 +52,7 @@ class DeviceWorker:
         self.cyclic_interval = 0.02
         self._next_control = float("inf")
         self.latest_control = MotorControl(False, 0, 0, 0, 0)
+        self.latest_controls: dict[int, MotorControl] = {}
         self._thread.start()
 
     def submit(self, name: str, *args: Any) -> None:
@@ -124,6 +126,18 @@ class DeviceWorker:
             frame = build_group_control_frame(selected, control, self.byteorder)
             self._write(frame, f"{note}（多控 {len(selected)} 节点）")
 
+    def _send_controls(
+        self, controls: dict[int, MotorControl], note: str = "控制报文"
+    ) -> None:
+        if len(controls) == 1:
+            node, control = next(iter(controls.items()))
+            self._write(
+                build_single_control_frame(int(node), control, self.byteorder), note
+            )
+        else:
+            frame = build_multi_control_frame(controls, self.byteorder)
+            self._write(frame, f"{note}（多控 {len(controls)} 节点）")
+
     def _flush_due_controls(self, now: float) -> None:
         """Emit one control per elapsed cycle so polling cannot starve it."""
 
@@ -131,7 +145,10 @@ class DeviceWorker:
             return
         burst = 0
         while self.cyclic_enabled and now >= self._next_control and burst < 10:
-            self._send_control(self.latest_control, "周期单控")
+            if self.latest_controls:
+                self._send_controls(self.latest_controls, "周期多控")
+            else:
+                self._send_control(self.latest_control, "周期单控")
             self._next_control += self.cyclic_interval
             burst += 1
         if now >= self._next_control:
@@ -163,6 +180,8 @@ class DeviceWorker:
                     if node == self.node_id:
                         self._emit("device_status", device)
             except Exception as exc:
+                if isinstance(exc, OSError) and not isinstance(exc, TimeoutError):
+                    raise
                 self._emit("warning", f"节点 {node} 查询失败：{exc}")
 
     def _connect(self, port: str, baudrate: int, byteorder: str, node_id: int) -> None:
@@ -171,6 +190,7 @@ class DeviceWorker:
         self.byteorder = byteorder
         self.node_id = node_id
         self.control_nodes = (node_id,)
+        self.latest_controls.clear()
         if port == "__SIMULATOR__":
             self.transport = SimulatedTransport(node_id=node_id, byteorder=byteorder)
             description = "模拟设备"
@@ -201,7 +221,12 @@ class DeviceWorker:
         if disable_first:
             try:
                 safe = MotorControl(False, self.latest_control.mode, self.latest_control.target_position, 0, 0)
-                self._send_control(safe, "断开前下使能")
+                if self.latest_controls:
+                    self._send_controls(
+                        {node: safe for node in self.control_nodes}, "断开前下使能"
+                    )
+                else:
+                    self._send_control(safe, "断开前下使能")
             except Exception as exc:
                 self._emit("warning", f"断开前下使能发送失败：{exc}")
         try:
@@ -232,19 +257,29 @@ class DeviceWorker:
         elif name == "set_node":
             self.node_id = int(args[0])
             self.control_nodes = (self.node_id,)
+            self.latest_controls.clear()
             self._emit("notice", f"当前通信 Node ID 已切换为 {self.node_id}")
         elif name == "send_control":
             self.latest_control = args[0]
+            self.latest_controls.clear()
             if len(args) > 1 and args[1]:
                 self.control_nodes = tuple(int(n) for n in args[1])
             self._send_control(self.latest_control)
+        elif name == "send_controls":
+            controls = dict(args[0])
+            self.latest_controls = controls
+            self.control_nodes = tuple(sorted(controls))
+            if controls:
+                self.latest_control = controls[self.control_nodes[0]]
+            self._send_controls(self.latest_controls)
         elif name == "emergency_disable":
             safe = MotorControl(False, self.latest_control.mode, self.latest_control.target_position, 0, 0)
             self.latest_control = safe
+            self.latest_controls = {node: safe for node in self.control_nodes}
             self.cyclic_enabled = False
-            self._send_control(safe, "立即下使能")
+            self._send_controls(self.latest_controls, "立即下使能")
             time.sleep(0.003)
-            self._send_control(safe, "立即下使能（重复）")
+            self._send_controls(self.latest_controls, "立即下使能（重复）")
             self._emit("disabled", None)
         elif name == "configure_poll":
             self.poll_enabled = bool(args[0])
@@ -255,12 +290,26 @@ class DeviceWorker:
         elif name == "query_status":
             self._poll_once()
         elif name == "configure_cyclic":
+            was_enabled = self.cyclic_enabled
             self.latest_control = args[0]
+            self.latest_controls.clear()
             self.cyclic_enabled = bool(args[1])
-            self.cyclic_interval = max(0.01, float(args[2]))
+            self.cyclic_interval = max(0.001, float(args[2]))
             if len(args) > 3 and args[3]:
                 self.control_nodes = tuple(int(n) for n in args[3])
-            self._next_control = time.monotonic()
+            if not was_enabled and self.cyclic_enabled:
+                self._next_control = time.monotonic()
+        elif name == "configure_cyclic_group":
+            was_enabled = self.cyclic_enabled
+            controls = dict(args[0])
+            self.latest_controls = controls
+            if controls:
+                self.control_nodes = tuple(sorted(controls))
+                self.latest_control = controls[self.control_nodes[0]]
+            self.cyclic_enabled = bool(args[1])
+            self.cyclic_interval = max(0.001, float(args[2]))
+            if not was_enabled and self.cyclic_enabled:
+                self._next_control = time.monotonic()
         elif name == "service":
             self._service(args[0], args[1] if len(args) > 1 else "服务请求")
         elif name == "set_node_by_uid":
@@ -289,6 +338,7 @@ class DeviceWorker:
             if response.ok:
                 self.node_id = int(new_node)
                 self.control_nodes = (self.node_id,)
+                self.latest_controls.clear()
                 self._emit("node_changed", self.node_id)
         elif name == "change_baud":
             payload, new_baud = args

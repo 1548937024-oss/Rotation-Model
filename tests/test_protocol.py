@@ -6,6 +6,7 @@ from motor_protocol import (
     MotorControl,
     ProtocolError,
     build_group_control_frame,
+    build_multi_control_frame,
     build_frame,
     build_query,
     build_read_did,
@@ -58,6 +59,36 @@ class CrcAndFrameTests(unittest.TestCase):
             build_group_control_frame((9,), control)
         with self.assertRaises(ProtocolError):
             build_group_control_frame(tuple(range(1, 10)), control)
+
+    def test_multi_control_frame_per_node_slots(self) -> None:
+        node1 = MotorControl(True, 0, 100, 10, 5)
+        node2 = MotorControl(True, 1, 200, -20, 15)
+        frame = build_multi_control_frame({1: node1, 2: node2})
+        mid, payload = parse_full_frame(frame)
+        self.assertEqual(mid, 0x200)
+        self.assertEqual(len(payload), 10)
+        self.assertEqual(payload[0:5], node1.pack())
+        self.assertEqual(payload[5:10], node2.pack())
+
+    def test_multi_control_frame_fills_idle_slots(self) -> None:
+        node1 = MotorControl(True, 0, 100, 10, 5)
+        node3 = MotorControl(True, 0, 300, 30, 10)
+        frame = build_multi_control_frame({1: node1, 3: node3})
+        mid, payload = parse_full_frame(frame)
+        self.assertEqual(mid, 0x200)
+        self.assertEqual(len(payload), 15)
+        self.assertEqual(payload[0:5], node1.pack())
+        self.assertEqual(payload[5:10], MotorControl(False, 0, 0, 0, 0).pack())
+        self.assertEqual(payload[10:15], node3.pack())
+
+    def test_multi_control_frame_validation(self) -> None:
+        control = MotorControl(False, 0, 0, 0, 0)
+        with self.assertRaises(ProtocolError):
+            build_multi_control_frame({})
+        with self.assertRaises(ProtocolError):
+            build_multi_control_frame({0: control})
+        with self.assertRaises(ProtocolError):
+            build_multi_control_frame({9: control})
 
     def test_full_frame_round_trip(self) -> None:
         payload = build_read_did(0x1018, 4)

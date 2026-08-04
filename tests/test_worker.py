@@ -4,8 +4,13 @@ import queue
 import time
 import unittest
 
-from device_worker import DeviceWorker
-from motor_protocol import MotorControl, build_read_did, build_set_node_id_service
+from device_worker import DeviceWorker, WorkerCommand
+from motor_protocol import (
+    MotorControl,
+    build_read_did,
+    build_set_node_id_service,
+    parse_full_frame,
+)
 
 
 class WorkerEndToEndTests(unittest.TestCase):
@@ -137,6 +142,220 @@ class WorkerEndToEndTests(unittest.TestCase):
                     break
             motions = [payload for kind, payload in events if kind == "multi_motion"]
             self.assertTrue(any(node == 1 for node, _ in motions))
+        finally:
+            worker.shutdown()
+
+    def test_cyclic_update_uses_latest_control(self) -> None:
+        class RecordingTransport:
+            def __init__(self) -> None:
+                self.writes: list[bytes] = []
+                self.is_open = True
+
+            def write(self, data: bytes) -> int:
+                self.writes.append(bytes(data))
+                return len(data)
+
+            def read(self, size: int = 1) -> bytes:
+                return b""
+
+            def reset_input_buffer(self) -> None:
+                return None
+
+            def close(self) -> None:
+                self.is_open = False
+
+        worker = DeviceWorker()
+        try:
+            transport = RecordingTransport()
+            worker.transport = transport
+            worker.control_nodes = (1,)
+            worker.byteorder = "little"
+            worker._handle(
+                WorkerCommand(
+                    "configure_cyclic",
+                    (MotorControl(True, 0, 100, 10, 5), True, 0.02, (1,)),
+                )
+            )
+            worker._handle(
+                WorkerCommand(
+                    "configure_cyclic",
+                    (MotorControl(True, 0, 200, 20, 10), True, 0.02, (1,)),
+                )
+            )
+            now = time.monotonic()
+            worker._next_control = now - 0.05
+            worker._flush_due_controls(now)
+            self.assertGreaterEqual(len(transport.writes), 1)
+            mid, payload = parse_full_frame(transport.writes[0])
+            self.assertEqual(mid, 0x201)
+            self.assertEqual(
+                MotorControl.unpack(payload), MotorControl(True, 0, 200, 20, 10)
+            )
+        finally:
+            worker.shutdown()
+
+    def test_send_controls_builds_per_node_group_frame(self) -> None:
+        class RecordingTransport:
+            def __init__(self) -> None:
+                self.writes: list[bytes] = []
+                self.is_open = True
+
+            def write(self, data: bytes) -> int:
+                self.writes.append(bytes(data))
+                return len(data)
+
+            def read(self, size: int = 1) -> bytes:
+                return b""
+
+            def reset_input_buffer(self) -> None:
+                return None
+
+            def close(self) -> None:
+                self.is_open = False
+
+        worker = DeviceWorker()
+        try:
+            transport = RecordingTransport()
+            worker.transport = transport
+            worker.byteorder = "little"
+            node1 = MotorControl(True, 0, 100, 10, 5)
+            node2 = MotorControl(True, 1, 200, -20, 15)
+            worker._handle(WorkerCommand("send_controls", ({1: node1, 2: node2},)))
+            self.assertGreaterEqual(len(transport.writes), 1)
+            mid, payload = parse_full_frame(transport.writes[0])
+            self.assertEqual(mid, 0x200)
+            self.assertEqual(payload[0:5], node1.pack())
+            self.assertEqual(payload[5:10], node2.pack())
+            self.assertEqual(worker.control_nodes, (1, 2))
+        finally:
+            worker.shutdown()
+
+    def test_cyclic_group_uses_latest_controls(self) -> None:
+        class RecordingTransport:
+            def __init__(self) -> None:
+                self.writes: list[bytes] = []
+                self.is_open = True
+
+            def write(self, data: bytes) -> int:
+                self.writes.append(bytes(data))
+                return len(data)
+
+            def read(self, size: int = 1) -> bytes:
+                return b""
+
+            def reset_input_buffer(self) -> None:
+                return None
+
+            def close(self) -> None:
+                self.is_open = False
+
+        worker = DeviceWorker()
+        try:
+            transport = RecordingTransport()
+            worker.transport = transport
+            worker.byteorder = "little"
+            worker._handle(
+                WorkerCommand(
+                    "configure_cyclic_group",
+                    ({1: MotorControl(True, 0, 100, 10, 5), 2: MotorControl(True, 0, 200, 20, 10)}, True, 0.02),
+                )
+            )
+            worker._handle(
+                WorkerCommand(
+                    "configure_cyclic_group",
+                    ({1: MotorControl(True, 0, 300, 30, 15), 2: MotorControl(True, 0, 400, -30, -15)}, True, 0.02),
+                )
+            )
+            now = time.monotonic()
+            worker._next_control = now - 0.05
+            worker._flush_due_controls(now)
+            self.assertGreaterEqual(len(transport.writes), 1)
+            mid, payload = parse_full_frame(transport.writes[0])
+            self.assertEqual(mid, 0x200)
+            self.assertEqual(payload[0:5], MotorControl(True, 0, 300, 30, 15).pack())
+            self.assertEqual(payload[5:10], MotorControl(True, 0, 400, -30, -15).pack())
+        finally:
+            worker.shutdown()
+
+    def test_emergency_disable_multi_sends_disabled_group(self) -> None:
+        class RecordingTransport:
+            def __init__(self) -> None:
+                self.writes: list[bytes] = []
+                self.is_open = True
+
+            def write(self, data: bytes) -> int:
+                self.writes.append(bytes(data))
+                return len(data)
+
+            def read(self, size: int = 1) -> bytes:
+                return b""
+
+            def reset_input_buffer(self) -> None:
+                return None
+
+            def close(self) -> None:
+                self.is_open = False
+
+        worker = DeviceWorker()
+        try:
+            transport = RecordingTransport()
+            worker.transport = transport
+            worker.byteorder = "little"
+            worker._handle(
+                WorkerCommand(
+                    "send_controls",
+                    ({1: MotorControl(True, 0, 100, 10, 5), 2: MotorControl(True, 0, 200, 20, 10)},),
+                )
+            )
+            transport.writes.clear()
+            worker._handle(WorkerCommand("emergency_disable", ()))
+            self.assertGreaterEqual(len(transport.writes), 2)
+            mid, payload = parse_full_frame(transport.writes[0])
+            self.assertEqual(mid, 0x200)
+            for index in range(2):
+                control = MotorControl.unpack(payload[index * 5 : (index + 1) * 5])
+                self.assertFalse(control.enable)
+                self.assertEqual(control.target_iq, 0)
+        finally:
+            worker.shutdown()
+
+    def test_poll_reports_transport_error_when_node_write_fails(self) -> None:
+        from motor_protocol import build_reply_tail
+
+        class NodeOneTransport:
+            def __init__(self) -> None:
+                self._rx = bytearray()
+                self.is_open = True
+
+            def write(self, data: bytes) -> int:
+                if len(data) == 3 and data[0] == 0xAA:
+                    mid = int.from_bytes(data[1:3], "little")
+                    if mid == 0x182:
+                        raise PermissionError(13, "拒绝访问。", None, 5)
+                    if mid == 0x181:
+                        self._rx.extend(build_reply_tail(mid, bytes.fromhex("80 00 00 00 00")))
+                return len(data)
+
+            def read(self, size: int = 1) -> bytes:
+                out = bytes(self._rx[:size])
+                del self._rx[:size]
+                return out
+
+            def reset_input_buffer(self) -> None:
+                self._rx.clear()
+
+            def close(self) -> None:
+                self.is_open = False
+
+        worker = DeviceWorker()
+        try:
+            worker.transport = NodeOneTransport()
+            worker.control_nodes = (1, 2)
+            worker.byteorder = "little"
+            worker.node_id = 1
+            worker._poll_count = 1
+            with self.assertRaises(PermissionError):
+                worker._poll_once()
         finally:
             worker.shutdown()
 

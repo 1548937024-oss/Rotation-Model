@@ -44,7 +44,7 @@ def clamp_control_value(value: int | str, low: int, high: int) -> int:
 class MotorHostApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("电机模组串口上位机 V1.0")
+        self.title("电机模组串口上位机 V1.02")
         self.geometry("1180x790")
         self.minsize(1040, 700)
         self.worker = DeviceWorker()
@@ -89,6 +89,16 @@ class MotorHostApp(tk.Tk):
         self.poll_ms_var = tk.IntVar(value=100)
         self.disable_on_disconnect_var = tk.BooleanVar(value=True)
 
+        self.mn_enable_vars = [tk.BooleanVar(value=False) for _ in range(5)]
+        self.mn_mode_vars = [tk.StringVar(value="位置模式") for _ in range(5)]
+        self.mn_position_vars = [tk.StringVar(value="0") for _ in range(5)]
+        self.mn_speed_vars = [tk.StringVar(value="20") for _ in range(5)]
+        self.mn_iq_vars = [tk.StringVar(value="20") for _ in range(5)]
+        self.mn_active_vars = [tk.BooleanVar(value=(i == 0)) for i in range(5)]
+        self.mn_cyclic_var = tk.BooleanVar(value=False)
+        self.mn_cyclic_ms_var = tk.IntVar(value=20)
+        self.multi_status_error = tk.StringVar(value="未查询")
+
         self.status_enable = tk.StringVar(value="--")
         self.status_mode = tk.StringVar(value="--")
         self.status_position = tk.StringVar(value="--")
@@ -125,12 +135,15 @@ class MotorHostApp(tk.Tk):
         notebook = ttk.Notebook(root)
         notebook.pack(fill="both", expand=True, pady=(8, 0))
         control_tab = ttk.Frame(notebook, padding=10)
+        multi_tab = ttk.Frame(notebook, padding=10)
         service_tab = ttk.Frame(notebook, padding=10)
         raw_tab = ttk.Frame(notebook, padding=10)
         notebook.add(control_tab, text="控制与状态")
+        notebook.add(multi_tab, text="多节点控制")
         notebook.add(service_tab, text="参数与服务")
         notebook.add(raw_tab, text="报文调试")
         self._build_control_tab(control_tab)
+        self._build_multi_tab(multi_tab)
         self._build_service_tab(service_tab)
         self._build_raw_tab(raw_tab)
 
@@ -187,6 +200,7 @@ class MotorHostApp(tk.Tk):
             highlightthickness=0,
             borderwidth=0,
             length=250,
+            command=self._sync_cyclic,
         ).grid(row=row, column=1, sticky="ew", padx=5)
         entry = ttk.Entry(parent, textvariable=variable, width=8, justify="right")
         entry.grid(row=row, column=2, sticky="w", padx=(4, 2))
@@ -196,6 +210,7 @@ class MotorHostApp(tk.Tk):
 
         entry.bind("<FocusOut>", clamp_entry)
         entry.bind("<Return>", clamp_entry)
+        entry.bind("<KeyRelease>", lambda _event: self._sync_cyclic())
         ttk.Label(parent, text=f"{unit}  [{low}~{high}]").grid(
             row=row, column=3, sticky="w", padx=(2, 5)
         )
@@ -207,17 +222,21 @@ class MotorHostApp(tk.Tk):
 
         control = ttk.LabelFrame(tab, text="控制（MSG_Control1 / MSG_GroupControl1）", padding=10)
         control.grid(row=0, column=0, sticky="nsew", padx=(0, 5), pady=(0, 8))
-        ttk.Checkbutton(control, text="电机使能", variable=self.enable_var).grid(
+        ttk.Checkbutton(
+            control, text="电机使能", variable=self.enable_var, command=self._sync_cyclic
+        ).grid(
             row=0, column=0, sticky="w", padx=5, pady=7
         )
         ttk.Label(control, text="运行模式").grid(row=1, column=0, sticky="w", padx=5, pady=7)
-        ttk.Combobox(
+        mode_combo = ttk.Combobox(
             control,
             textvariable=self.mode_var,
             values=("位置模式", "速度模式"),
             state="readonly",
             width=12,
-        ).grid(row=1, column=1, sticky="w", padx=5)
+        )
+        mode_combo.grid(row=1, column=1, sticky="w", padx=5)
+        mode_combo.bind("<<ComboboxSelected>>", lambda _event: self._sync_cyclic())
         self._labeled_slider(
             control, 2, "目标位置", self.position_var, *POSITION_LIMITS, "count / 100%"
         )
@@ -240,7 +259,12 @@ class MotorHostApp(tk.Tk):
             buttons, text="周期发送", variable=self.cyclic_var, command=self._configure_cyclic
         ).pack(side="left", padx=(20, 3))
         ttk.Spinbox(
-            buttons, from_=10, to=1000, textvariable=self.cyclic_ms_var, width=7
+            buttons,
+            from_=1,
+            to=200,
+            textvariable=self.cyclic_ms_var,
+            width=7,
+            command=self._sync_cyclic,
         ).pack(side="left", padx=3)
         ttk.Label(buttons, text="ms").pack(side="left")
 
@@ -248,7 +272,10 @@ class MotorHostApp(tk.Tk):
         node_sel.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(10, 0))
         for i in range(5):
             ttk.Checkbutton(
-                node_sel, text=f"Node {i + 1}", variable=self.node_sel_vars[i]
+                node_sel,
+                text=f"Node {i + 1}",
+                variable=self.node_sel_vars[i],
+                command=self._sync_cyclic,
             ).pack(side="left", padx=6)
 
         status = ttk.LabelFrame(tab, text="多节点实时状态", padding=10)
@@ -316,6 +343,147 @@ class MotorHostApp(tk.Tk):
         ttk.Button(log_box, text="清空日志", command=self._clear_log).grid(
             row=1, column=0, sticky="e", pady=(5, 0)
         )
+
+    def _build_multi_tab(self, tab: ttk.Frame) -> None:
+        tab.columnconfigure(0, weight=1)
+        tab.columnconfigure(1, weight=1)
+        tab.rowconfigure(1, weight=1)
+
+        params = ttk.LabelFrame(tab, text="节点参数（每个节点独立设置）", padding=10)
+        params.grid(row=0, column=0, sticky="nsew", padx=(0, 5), pady=(0, 8))
+        headers = ("节点", "使能", "运行模式", "目标位置", "目标速度", "目标 Iq", "参与下发")
+        for col, text in enumerate(headers):
+            ttk.Label(params, text=text, style="Section.TLabel").grid(
+                row=0, column=col, padx=6, pady=(0, 6)
+            )
+        for i in range(5):
+            row = i + 1
+            ttk.Label(params, text=f"Node {i + 1}").grid(
+                row=row, column=0, padx=6, pady=4
+            )
+            ttk.Checkbutton(
+                params, variable=self.mn_enable_vars[i], command=self._sync_multi_cyclic
+            ).grid(row=row, column=1, padx=6)
+            mode_combo = ttk.Combobox(
+                params,
+                textvariable=self.mn_mode_vars[i],
+                values=("位置模式", "速度模式"),
+                state="readonly",
+                width=10,
+            )
+            mode_combo.grid(row=row, column=2, padx=6)
+            mode_combo.bind(
+                "<<ComboboxSelected>>", lambda _event, idx=i: self._sync_multi_cyclic()
+            )
+            position_entry = ttk.Entry(
+                params, textvariable=self.mn_position_vars[i], width=8, justify="right"
+            )
+            position_entry.grid(row=row, column=3, padx=6)
+            speed_entry = ttk.Entry(
+                params, textvariable=self.mn_speed_vars[i], width=6, justify="right"
+            )
+            speed_entry.grid(row=row, column=4, padx=6)
+            iq_entry = ttk.Entry(
+                params, textvariable=self.mn_iq_vars[i], width=6, justify="right"
+            )
+            iq_entry.grid(row=row, column=5, padx=6)
+            for entry in (position_entry, speed_entry, iq_entry):
+                entry.bind("<Return>", lambda _event, idx=i: self._sync_multi_cyclic())
+            ttk.Checkbutton(
+                params, variable=self.mn_active_vars[i], command=self._sync_multi_cyclic
+            ).grid(row=row, column=6, padx=6)
+        ttk.Label(
+            params,
+            text="参与下发的节点需从 Node 1 开始连续勾选；未参与的节点不会收到控制报文。",
+            foreground="#555555",
+        ).grid(row=6, column=0, columnspan=7, sticky="w", padx=6, pady=(8, 0))
+
+        actions = ttk.Frame(tab)
+        actions.grid(row=1, column=0, sticky="ew", padx=(0, 5), pady=(0, 8))
+        ttk.Button(actions, text="发送一次", command=self._multi_send_once).pack(
+            side="left", padx=4
+        )
+        ttk.Button(
+            actions,
+            text="立即下使能",
+            style="Danger.TButton",
+            command=self._multi_emergency_disable,
+        ).pack(side="left", padx=4)
+        ttk.Button(actions, text="全选 1~5", command=self._multi_select_all).pack(
+            side="left", padx=8
+        )
+        ttk.Button(actions, text="仅 Node 1", command=self._multi_select_first).pack(
+            side="left", padx=4
+        )
+        ttk.Checkbutton(
+            actions,
+            text="周期发送",
+            variable=self.mn_cyclic_var,
+            command=self._configure_multi_cyclic,
+        ).pack(side="left", padx=(20, 3))
+        ttk.Spinbox(
+            actions,
+            from_=1,
+            to=200,
+            textvariable=self.mn_cyclic_ms_var,
+            width=7,
+            command=self._sync_multi_cyclic,
+        ).pack(side="left", padx=3)
+        ttk.Label(actions, text="ms").pack(side="left")
+
+        monitor = ttk.LabelFrame(tab, text="多节点实时监控", padding=10)
+        monitor.grid(row=0, column=1, rowspan=2, sticky="nsew", padx=(5, 0), pady=(0, 8))
+        monitor.columnconfigure(0, weight=1)
+        monitor.rowconfigure(0, weight=1)
+        columns = ("node", "enable", "mode", "position", "speed", "iq", "voltage", "temp", "error")
+        headers = {
+            "node": "Node",
+            "enable": "使能",
+            "mode": "模式",
+            "position": "位置",
+            "speed": "速度",
+            "iq": "Iq",
+            "voltage": "电压",
+            "temp": "温度",
+            "error": "故障",
+        }
+        widths = {
+            "node": 45,
+            "enable": 55,
+            "mode": 55,
+            "position": 65,
+            "speed": 50,
+            "iq": 45,
+            "voltage": 70,
+            "temp": 55,
+            "error": 80,
+        }
+        self.multi_status_table = ttk.Treeview(
+            monitor, columns=columns, show="headings", height=7
+        )
+        for column in columns:
+            self.multi_status_table.heading(column, text=headers[column])
+            self.multi_status_table.column(
+                column, width=widths[column], anchor="center", stretch=True
+            )
+        self.multi_status_table.grid(row=0, column=0, sticky="nsew")
+        self.multi_error_label = ttk.Label(
+            monitor, textvariable=self.multi_status_error, style="Bad.TLabel"
+        )
+        self.multi_error_label.grid(row=1, column=0, sticky="w", padx=5, pady=6)
+        polling = ttk.Frame(monitor)
+        polling.grid(row=2, column=0, sticky="ew", pady=(7, 0))
+        ttk.Checkbutton(
+            polling, text="自动查询", variable=self.poll_var, command=self._configure_multi_poll
+        ).pack(side="left", padx=4)
+        ttk.Spinbox(
+            polling, from_=20, to=5000, textvariable=self.poll_ms_var, width=7
+        ).pack(side="left", padx=3)
+        ttk.Label(polling, text="ms").pack(side="left")
+        ttk.Button(polling, text="立即查询", command=self._query_status).pack(
+            side="left", padx=12
+        )
+        self._reset_status_table()
 
     def _service_row(
         self,
@@ -604,8 +772,8 @@ class MotorHostApp(tk.Tk):
             interval = int(self.cyclic_ms_var.get())
             control.pack()
             nodes = self._validate_selected_nodes()
-            if not 10 <= interval <= 1000:
-                raise ProtocolError("周期必须为 10~1000 ms")
+            if not 1 <= interval <= 200:
+                raise ProtocolError("周期必须为 1~200 ms")
         except (ValueError, tk.TclError, ProtocolError) as exc:
             self.cyclic_var.set(False)
             messagebox.showerror("周期控制参数错误", str(exc))
@@ -621,7 +789,136 @@ class MotorHostApp(tk.Tk):
             nodes,
         )
 
-    def _configure_poll(self) -> None:
+    def _sync_cyclic(self, _value: object | None = None) -> None:
+        if not (self.connected and self.cyclic_var.get()):
+            return
+        try:
+            control = self._control_value()
+            control.pack()
+            interval = int(self.cyclic_ms_var.get())
+            if not 1 <= interval <= 200:
+                raise ProtocolError("周期必须为 1~200 ms")
+            nodes = self._validate_selected_nodes()
+        except (ValueError, tk.TclError):
+            return
+        except ProtocolError as exc:
+            self.cyclic_var.set(False)
+            try:
+                nodes = self._selected_nodes()
+            except ProtocolError:
+                nodes = (1,)
+            self.worker.submit("configure_cyclic", control, False, 0.02, nodes)
+            messagebox.showerror("周期控制参数错误", str(exc))
+            return
+        self.worker.submit("configure_cyclic", control, True, interval / 1000, nodes)
+
+    def _multi_nodes(self) -> tuple[int, ...]:
+        nodes = tuple(i + 1 for i, var in enumerate(self.mn_active_vars) if var.get())
+        if not nodes:
+            raise ProtocolError("多节点控制至少需要勾选一个节点")
+        return self._check_contiguous_nodes(nodes)
+
+    def _multi_controls(self) -> dict[int, MotorControl]:
+        nodes = self._multi_nodes()
+        controls: dict[int, MotorControl] = {}
+        for i in range(5):
+            node = i + 1
+            if node not in nodes:
+                continue
+            mode = RunMode.POSITION if self.mn_mode_vars[i].get() == "位置模式" else RunMode.SPEED
+            position = self._clamp_control_variable(self.mn_position_vars[i], *POSITION_LIMITS)
+            speed = self._clamp_control_variable(self.mn_speed_vars[i], *SPEED_LIMITS)
+            iq = self._clamp_control_variable(self.mn_iq_vars[i], *IQ_LIMITS)
+            control = MotorControl(
+                bool(self.mn_enable_vars[i].get()), int(mode), position, speed, iq
+            )
+            control.pack()
+            controls[node] = control
+        return controls
+
+    def _multi_select_all(self) -> None:
+        for var in self.mn_active_vars:
+            var.set(True)
+        self._sync_multi_cyclic()
+
+    def _multi_select_first(self) -> None:
+        for i, var in enumerate(self.mn_active_vars):
+            var.set(i == 0)
+        self._sync_multi_cyclic()
+
+    def _multi_send_once(self) -> None:
+        if not self._require_connected():
+            return
+        try:
+            controls = self._multi_controls()
+        except (ValueError, tk.TclError, ProtocolError) as exc:
+            messagebox.showerror("多节点控制参数错误", str(exc))
+            return
+        if any(control.enable for control in controls.values()) and not self._confirm_enable(
+            True
+        ):
+            return
+        self.worker.submit("send_controls", controls)
+
+    def _multi_emergency_disable(self) -> None:
+        if not self._require_connected():
+            return
+        self.mn_cyclic_var.set(False)
+        for var in self.mn_enable_vars:
+            var.set(False)
+        self.worker.submit("emergency_disable")
+
+    def _configure_multi_cyclic(self) -> None:
+        if not self._require_connected():
+            self.mn_cyclic_var.set(False)
+            return
+        try:
+            controls = self._multi_controls()
+            interval = int(self.mn_cyclic_ms_var.get())
+            if not 1 <= interval <= 200:
+                raise ProtocolError("周期必须为 1~200 ms")
+        except (ValueError, tk.TclError, ProtocolError) as exc:
+            self.mn_cyclic_var.set(False)
+            messagebox.showerror("周期控制参数错误", str(exc))
+            return
+        if self.mn_cyclic_var.get() and any(
+            control.enable for control in controls.values()
+        ) and not self._confirm_enable(True):
+            self.mn_cyclic_var.set(False)
+            return
+        self.worker.submit(
+            "configure_cyclic_group", controls, self.mn_cyclic_var.get(), interval / 1000
+        )
+
+    def _sync_multi_cyclic(self, _value: object | None = None) -> None:
+        if not (self.connected and self.mn_cyclic_var.get()):
+            return
+        try:
+            controls = self._multi_controls()
+            interval = int(self.mn_cyclic_ms_var.get())
+            if not 1 <= interval <= 200:
+                raise ProtocolError("周期必须为 1~200 ms")
+        except (ValueError, tk.TclError):
+            return
+        except ProtocolError as exc:
+            self.mn_cyclic_var.set(False)
+            messagebox.showerror("周期控制参数错误", str(exc))
+            return
+        self.worker.submit("configure_cyclic_group", controls, True, interval / 1000)
+
+    def _configure_multi_poll(self) -> None:
+        if not self._require_connected():
+            self.poll_var.set(False)
+            return
+        try:
+            nodes = self._multi_nodes()
+        except ProtocolError as exc:
+            self.poll_var.set(False)
+            messagebox.showerror("多节点查询错误", str(exc))
+            return
+        self._configure_poll(nodes=nodes)
+
+    def _configure_poll(self, nodes: tuple[int, ...] | None = None) -> None:
         if not self._require_connected():
             self.poll_var.set(False)
             return
@@ -629,12 +926,13 @@ class MotorHostApp(tk.Tk):
             interval = int(self.poll_ms_var.get())
             if not 20 <= interval <= 5000:
                 raise ProtocolError("查询周期必须为 20~5000 ms")
+            selected = self._selected_nodes() if nodes is None else nodes
         except (ValueError, tk.TclError, ProtocolError) as exc:
             self.poll_var.set(False)
             messagebox.showerror("查询周期错误", str(exc))
             return
         self.worker.submit(
-            "configure_poll", self.poll_var.get(), interval / 1000, self._selected_nodes()
+            "configure_poll", self.poll_var.get(), interval / 1000, selected
         )
 
     def _query_status(self) -> None:
@@ -763,10 +1061,18 @@ class MotorHostApp(tk.Tk):
         for i in range(5):
             iid = str(i + 1)
             values = (i + 1, "--", "--", "--", "--", "--", "--", "--", "--")
-            if not self.status_table.exists(iid):
-                self.status_table.insert("", "end", iid=iid, values=values)
-            else:
-                self.status_table.item(iid, values=values)
+            self._apply_status_row(self.status_table, iid, values)
+            if getattr(self, "multi_status_table", None) is not None:
+                self._apply_status_row(self.multi_status_table, iid, values)
+        if getattr(self, "multi_error_label", None) is not None:
+            self.multi_status_error.set("未查询")
+
+    @staticmethod
+    def _apply_status_row(table: ttk.Treeview, iid: str, values: tuple) -> None:
+        if not table.exists(iid):
+            table.insert("", "end", iid=iid, values=values)
+        else:
+            table.item(iid, values=values)
 
     def _render_node_status(self, node_id: int) -> None:
         if not 1 <= node_id <= 5:
@@ -778,27 +1084,30 @@ class MotorHostApp(tk.Tk):
         if motion.error:
             mode_text = "--"
             error_text = f"故障 {motion.error_code}：{motion.error_text}"
-            self.error_label.configure(style="Bad.TLabel")
+            label_style = "Bad.TLabel"
         else:
             mode_names = {0: "位置", 1: "速度"}
             mode_text = mode_names.get(motion.mode, f"模式 {motion.mode}")
             error_text = "无故障"
-            self.error_label.configure(style="Ok.TLabel")
+            label_style = "Ok.TLabel"
         self.status_error.set(f"节点 {node_id}：{error_text}")
-        self.status_table.item(
-            str(node_id),
-            values=(
-                node_id,
-                "已使能" if motion.enabled else "未使能",
-                mode_text,
-                f"{motion.actual_position}",
-                f"{motion.actual_speed}",
-                f"{motion.actual_iq}",
-                f"{device.voltage_mv / 1000:.3f} V" if device else "--",
-                f"{device.temperature_c} °C" if device else "--",
-                error_text,
-            ),
+        self.error_label.configure(style=label_style)
+        values = (
+            node_id,
+            "已使能" if motion.enabled else "未使能",
+            mode_text,
+            f"{motion.actual_position}",
+            f"{motion.actual_speed}",
+            f"{motion.actual_iq}",
+            f"{device.voltage_mv / 1000:.3f} V" if device else "--",
+            f"{device.temperature_c} °C" if device else "--",
+            error_text,
         )
+        self._apply_status_row(self.status_table, str(node_id), values)
+        if getattr(self, "multi_status_table", None) is not None:
+            self.multi_status_error.set(f"节点 {node_id}：{error_text}")
+            self.multi_error_label.configure(style=label_style)
+            self._apply_status_row(self.multi_status_table, str(node_id), values)
 
     def _update_motion(self, node_id: int, status: MotionStatus) -> None:
         self.node_motion[node_id] = status
@@ -839,6 +1148,7 @@ class MotorHostApp(tk.Tk):
                     self.connection_label.configure(style="Bad.TLabel")
                     self.connect_button.configure(text="连接")
                     self.cyclic_var.set(False)
+                    self.mn_cyclic_var.set(False)
                     self._reset_status_table()
                 elif kind == "multi_motion":
                     node_id, motion = payload
@@ -864,6 +1174,9 @@ class MotorHostApp(tk.Tk):
                 elif kind == "disabled":
                     self.enable_var.set(False)
                     self.cyclic_var.set(False)
+                    self.mn_cyclic_var.set(False)
+                    for var in self.mn_enable_vars:
+                        var.set(False)
                 elif kind == "log":
                     self._append_log(payload)
                 elif kind == "notice":
