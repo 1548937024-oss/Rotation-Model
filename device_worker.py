@@ -47,7 +47,9 @@ class DeviceWorker:
         self.poll_enabled = False
         self.poll_interval = 0.1
         self._next_poll = float("inf")
-        self._poll_count = 0
+        self._script_steps: list[tuple] | None = None
+        self._script_index = 0
+        self._script_next_time = float("inf")
         self.cyclic_enabled = False
         self.cyclic_interval = 0.02
         self._next_control = float("inf")
@@ -112,6 +114,41 @@ class DeviceWorker:
                 pass
             raise
 
+    def _start_script(self, steps: list[tuple]) -> None:
+        self._script_steps = list(steps)
+        self._script_index = 0
+        self._script_next_time = time.monotonic()
+
+    def _advance_script(self, now: float) -> None:
+        if self._script_steps is None:
+            return
+        while now >= self._script_next_time:
+            if self._script_index >= len(self._script_steps):
+                self._emit("notice", "脚本执行完成")
+                self._script_steps = None
+                return
+            step = self._script_steps[self._script_index]
+            self._script_index += 1
+            kind = step[0]
+            if kind == "delay":
+                self._script_next_time = now + float(step[1])
+                return
+            if kind == "frame":
+                _, mid, data = step
+                self._write(
+                    build_frame(mid, data, self.byteorder),
+                    f"脚本 [{self._script_index}] 完整帧 MID 0x{mid:03X}",
+                )
+            elif kind == "query":
+                _, mid = step
+                data = self._query(
+                    mid, f"脚本 [{self._script_index}] 查询 MID 0x{mid:03X}"
+                )
+                self._emit("raw_reply", (mid, data))
+            else:
+                raise RuntimeError(f"未知脚本步骤：{kind}")
+            self._script_next_time = now
+
     def _send_control(
         self,
         control: MotorControl,
@@ -165,7 +202,6 @@ class DeviceWorker:
         return response
 
     def _poll_once(self) -> None:
-        self._poll_count += 1
         for node in self.control_nodes:
             try:
                 motion_data = self._query(0x180 + node, f"查询节点 {node} 运动状态")
@@ -173,12 +209,11 @@ class DeviceWorker:
                 self._emit("multi_motion", (node, motion))
                 if node == self.node_id:
                     self._emit("motion_status", motion)
-                if self._poll_count % 5 == 0:
-                    device_data = self._query(0x280 + node, f"查询节点 {node} 设备状态")
-                    device = parse_device_status(device_data)
-                    self._emit("multi_device", (node, device))
-                    if node == self.node_id:
-                        self._emit("device_status", device)
+                device_data = self._query(0x280 + node, f"查询节点 {node} 设备状态")
+                device = parse_device_status(device_data)
+                self._emit("multi_device", (node, device))
+                if node == self.node_id:
+                    self._emit("device_status", device)
             except Exception as exc:
                 if isinstance(exc, OSError) and not isinstance(exc, TimeoutError):
                     raise
@@ -218,6 +253,7 @@ class DeviceWorker:
             return
         self.poll_enabled = False
         self.cyclic_enabled = False
+        self._script_steps = None
         if disable_first:
             try:
                 safe = MotorControl(False, self.latest_control.mode, self.latest_control.target_position, 0, 0)
@@ -356,6 +392,8 @@ class DeviceWorker:
                     "warning",
                     "设备未返回波特率写入响应；上位机已切换至新波特率，请立即查询状态验证通信。",
                 )
+        elif name == "raw_script":
+            self._start_script(args[0])
         elif name == "raw_frame":
             mid, data = args
             self._write(build_frame(mid, data, self.byteorder), f"原始完整帧 MID 0x{mid:03X}")
@@ -377,6 +415,8 @@ class DeviceWorker:
                 deadlines.append(self._next_poll)
             if self.transport is not None and self.cyclic_enabled:
                 deadlines.append(self._next_control)
+            if self.transport is not None and self._script_steps is not None:
+                deadlines.append(self._script_next_time)
             timeout = 0.05 if not deadlines else max(0.0, min(0.05, min(deadlines) - now))
             try:
                 command = self.commands.get(timeout=timeout)
@@ -391,6 +431,13 @@ class DeviceWorker:
             if self.transport is None:
                 continue
             now = time.monotonic()
+            if self._script_steps is not None:
+                try:
+                    self._advance_script(now)
+                except Exception as exc:
+                    self._script_steps = None
+                    self._emit("error", f"脚本执行失败：{exc}")
+                    self._handle_transport_error(exc)
             if self.cyclic_enabled:
                 try:
                     self._flush_due_controls(now)

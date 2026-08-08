@@ -74,6 +74,57 @@ class ControlUiTests(unittest.TestCase):
         with self.assertRaises(ProtocolError):
             stub._multi_nodes()
 
+    def test_multi_enable_all_checks_every_node(self) -> None:
+        class VariableStub:
+            def __init__(self, value: bool) -> None:
+                self.value = value
+
+            def set(self, value: object) -> None:
+                self.value = bool(value)
+
+        class MultiTabStub:
+            mn_enable_vars = [VariableStub(False) for _ in range(5)]
+
+            def _sync_multi_cyclic(self) -> None:
+                pass
+
+        stub = MultiTabStub()
+        MotorHostApp._multi_enable_all(stub)
+        self.assertTrue(all(var.value for var in stub.mn_enable_vars))
+
+    def test_raw_script_parser_builds_ordered_steps(self) -> None:
+        text = (
+            "# 注释\n"
+            "0x201 80 00 00 00 00\n"
+            "\n"
+            "0x181 ?\n"
+            "delay 150\n"
+            "0x280 C0 5D 1F\n"
+        )
+        steps = MotorHostApp._parse_raw_script(text, 20)
+        self.assertEqual(
+            steps,
+            [
+                ("frame", 0x201, bytes.fromhex("80 00 00 00 00")),
+                ("delay", 0.02),
+                ("query", 0x181),
+                ("delay", 0.15),
+                ("frame", 0x280, bytes.fromhex("C0 5D 1F")),
+            ],
+        )
+
+    def test_raw_script_parser_handles_leading_delay_and_zero_interval(self) -> None:
+        steps = MotorHostApp._parse_raw_script("delay 0\n0x201 80", 20)
+        self.assertEqual(steps, [("frame", 0x201, b"\x80")])
+        steps = MotorHostApp._parse_raw_script("delay 50\n0x201 80", 20)
+        self.assertEqual(steps, [("delay", 0.05), ("frame", 0x201, b"\x80")])
+
+    def test_raw_script_parser_reports_line_number_and_invalid_query(self) -> None:
+        with self.assertRaisesRegex(ProtocolError, "第 2 行"):
+            MotorHostApp._parse_raw_script("0x201 80\nXYZ 00", 20)
+        with self.assertRaisesRegex(ProtocolError, "第 1 行"):
+            MotorHostApp._parse_raw_script("0x181 ? 00", 20)
+
 
 if __name__ == "__main__":
     unittest.main()

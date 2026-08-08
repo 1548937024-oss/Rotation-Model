@@ -353,9 +353,55 @@ class WorkerEndToEndTests(unittest.TestCase):
             worker.control_nodes = (1, 2)
             worker.byteorder = "little"
             worker.node_id = 1
-            worker._poll_count = 1
             with self.assertRaises(PermissionError):
                 worker._poll_once()
+        finally:
+            worker.shutdown()
+
+    def test_poll_reads_device_status_every_cycle(self) -> None:
+        from motor_protocol import build_reply_tail
+
+        class CountingTransport:
+            def __init__(self) -> None:
+                self._rx = bytearray()
+                self.queries: list[int] = []
+                self.is_open = True
+
+            def write(self, data: bytes) -> int:
+                if len(data) == 3 and data[0] == 0xAA:
+                    mid = int.from_bytes(data[1:3], "little")
+                    self.queries.append(mid)
+                    if mid == 0x181:
+                        reply = bytes.fromhex("80 00 00 00 00")
+                    elif mid == 0x281:
+                        reply = bytes.fromhex("C0 5D 1F")
+                    else:
+                        return len(data)
+                    self._rx.extend(build_reply_tail(mid, reply))
+                return len(data)
+
+            def read(self, size: int = 1) -> bytes:
+                out = bytes(self._rx[:size])
+                del self._rx[:size]
+                return out
+
+            def reset_input_buffer(self) -> None:
+                self._rx.clear()
+
+            def close(self) -> None:
+                self.is_open = False
+
+        worker = DeviceWorker()
+        try:
+            transport = CountingTransport()
+            worker.transport = transport
+            worker.control_nodes = (1,)
+            worker.byteorder = "little"
+            worker.node_id = 1
+            worker._poll_once()
+            worker._poll_once()
+            self.assertEqual(transport.queries.count(0x281), 2)
+            self.assertEqual(transport.queries.count(0x181), 2)
         finally:
             worker.shutdown()
 
@@ -396,6 +442,103 @@ class WorkerEndToEndTests(unittest.TestCase):
             self.assertIsNone(worker.transport)
         finally:
             worker.shutdown()
+
+    def test_raw_script_sends_frames_and_queries(self) -> None:
+        from motor_protocol import build_frame, build_reply_tail
+
+        class ScriptTransport:
+            def __init__(self) -> None:
+                self.writes: list[bytes] = []
+                self._rx = bytearray()
+                self.is_open = True
+
+            def write(self, data: bytes) -> int:
+                self.writes.append(bytes(data))
+                if len(data) == 3 and data[0] == 0xAA:
+                    mid = int.from_bytes(data[1:3], "little")
+                    if mid == 0x181:
+                        self._rx.extend(
+                            build_reply_tail(mid, bytes.fromhex("80 00 00 00 00"))
+                        )
+                return len(data)
+
+            def read(self, size: int = 1) -> bytes:
+                out = bytes(self._rx[:size])
+                del self._rx[:size]
+                return out
+
+            def reset_input_buffer(self) -> None:
+                self._rx.clear()
+
+            def close(self) -> None:
+                self.is_open = False
+
+        worker = DeviceWorker()
+        try:
+            transport = ScriptTransport()
+            worker.transport = transport
+            worker.byteorder = "little"
+            steps = (
+                ("frame", 0x201, bytes.fromhex("80 00 00 00 00")),
+                ("delay", 0.001),
+                ("query", 0x181),
+            )
+            worker.submit("raw_script", steps)
+            deadline = time.monotonic() + 2.0
+            done = False
+            saw_reply = False
+            while time.monotonic() < deadline:
+                try:
+                    kind, payload = worker.events.get(timeout=0.05)
+                except queue.Empty:
+                    continue
+                if kind == "error":
+                    self.fail(payload)
+                if kind == "raw_reply":
+                    saw_reply = True
+                if kind == "notice" and "脚本执行完成" in str(payload):
+                    done = True
+                    break
+            self.assertTrue(done)
+            self.assertTrue(saw_reply)
+            self.assertEqual(
+                transport.writes[0],
+                build_frame(0x201, bytes.fromhex("80 00 00 00 00"), "little"),
+            )
+            query_writes = [
+                data
+                for data in transport.writes
+                if len(data) == 3 and int.from_bytes(data[1:3], "little") == 0x181
+            ]
+            self.assertTrue(query_writes)
+        finally:
+            worker.shutdown()
+
+    def test_poll_runs_during_script_delay(self) -> None:
+        self.worker.submit("connect", "__SIMULATOR__", 2000000, "big", 5)
+        self._wait_for("connected")
+        self.worker.submit("configure_poll", True, 0.02, (5,))
+        steps = (
+            ("frame", 0x205, bytes.fromhex("81 00 00 5A 14")),
+            ("delay", 0.25),
+        )
+        self.worker.submit("raw_script", steps)
+        deadline = time.monotonic() + 2.0
+        saw_device = False
+        saw_done = False
+        while time.monotonic() < deadline:
+            try:
+                kind, payload = self.worker.events.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            if kind == "device_status":
+                saw_device = True
+            if kind == "notice" and "脚本执行完成" in str(payload):
+                saw_done = True
+            if saw_device and saw_done:
+                break
+        self.assertTrue(saw_device)
+        self.assertTrue(saw_done)
 
 
 if __name__ == "__main__":

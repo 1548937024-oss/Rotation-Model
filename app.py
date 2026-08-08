@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import queue
+import time
 import tkinter as tk
 from tkinter import messagebox, scrolledtext, ttk
 from typing import Callable
@@ -44,9 +45,9 @@ def clamp_control_value(value: int | str, low: int, high: int) -> int:
 class MotorHostApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("电机模组串口上位机 V1.02")
-        self.geometry("1180x790")
-        self.minsize(1040, 700)
+        self.title("电机模组串口上位机 V1.03")
+        self.geometry("1440x850")
+        self.minsize(1200, 720)
         self.worker = DeviceWorker()
         self.connected = False
         self._enable_confirmed = False
@@ -69,6 +70,7 @@ class MotorHostApp(tk.Tk):
         style.configure("Ok.TLabel", foreground="#157A36", font=("Microsoft YaHei UI", 10, "bold"))
         style.configure("Bad.TLabel", foreground="#B3261E", font=("Microsoft YaHei UI", 10, "bold"))
         style.configure("Danger.TButton", foreground="#A00000", font=("Microsoft YaHei UI", 10, "bold"))
+        style.configure("Success.TButton", foreground="#157A36", font=("Microsoft YaHei UI", 10, "bold"))
 
     def _build_variables(self) -> None:
         self.port_var = tk.StringVar(value=SIMULATOR_LABEL)
@@ -118,6 +120,7 @@ class MotorHostApp(tk.Tk):
         self.raw_mid_var = tk.StringVar(value="0x201")
         self.raw_data_var = tk.StringVar(value="80 00 00 00 00")
         self.raw_reply_var = tk.StringVar(value="--")
+        self.script_interval_var = tk.IntVar(value=20)
 
     def _build_ui(self) -> None:
         root = ttk.Frame(self, padding=10)
@@ -344,92 +347,141 @@ class MotorHostApp(tk.Tk):
             row=1, column=0, sticky="e", pady=(5, 0)
         )
 
+    def _multi_slider_cell(
+        self,
+        parent: ttk.Frame,
+        row: int,
+        column: int,
+        variable: tk.Variable,
+        low: int,
+        high: int,
+    ) -> None:
+        cell = ttk.Frame(parent)
+        cell.grid(row=row, column=column, sticky="ew", padx=3, pady=2)
+        cell.columnconfigure(0, weight=1)
+        tk.Scale(
+            cell,
+            from_=low,
+            to=high,
+            orient="horizontal",
+            resolution=1,
+            showvalue=False,
+            variable=variable,
+            highlightthickness=0,
+            borderwidth=0,
+            length=220,
+            command=self._sync_multi_cyclic,
+        ).grid(row=0, column=0, sticky="ew")
+        entry = ttk.Entry(cell, textvariable=variable, width=6, justify="right")
+        entry.grid(row=1, column=0, sticky="w", pady=(1, 0))
+
+        def clamp_entry(_event: tk.Event | None = None) -> None:
+            self._clamp_control_variable(variable, low, high)
+            self._sync_multi_cyclic()
+
+        entry.bind("<FocusOut>", clamp_entry)
+        entry.bind("<Return>", clamp_entry)
+        entry.bind("<KeyRelease>", lambda _event: self._sync_multi_cyclic())
+
     def _build_multi_tab(self, tab: ttk.Frame) -> None:
-        tab.columnconfigure(0, weight=1)
+        tab.columnconfigure(0, weight=3)
         tab.columnconfigure(1, weight=1)
         tab.rowconfigure(1, weight=1)
 
-        params = ttk.LabelFrame(tab, text="节点参数（每个节点独立设置）", padding=10)
+        params = ttk.LabelFrame(tab, text="节点参数（每个节点独立设置）", padding=8)
         params.grid(row=0, column=0, sticky="nsew", padx=(0, 5), pady=(0, 8))
-        headers = ("节点", "使能", "运行模式", "目标位置", "目标速度", "目标 Iq", "参与下发")
+        headers = (
+            "节点",
+            "使能",
+            "运行模式",
+            "目标位置\ncount/100%",
+            "目标速度\n%额定转速",
+            "目标 Iq\n%额定Iq",
+            "参与下发",
+        )
         for col, text in enumerate(headers):
             ttk.Label(params, text=text, style="Section.TLabel").grid(
-                row=0, column=col, padx=6, pady=(0, 6)
+                row=0, column=col, padx=4, pady=(0, 6)
             )
         for i in range(5):
             row = i + 1
             ttk.Label(params, text=f"Node {i + 1}").grid(
-                row=row, column=0, padx=6, pady=4
+                row=row, column=0, padx=4, pady=4
             )
             ttk.Checkbutton(
                 params, variable=self.mn_enable_vars[i], command=self._sync_multi_cyclic
-            ).grid(row=row, column=1, padx=6)
+            ).grid(row=row, column=1, padx=4)
             mode_combo = ttk.Combobox(
                 params,
                 textvariable=self.mn_mode_vars[i],
                 values=("位置模式", "速度模式"),
                 state="readonly",
-                width=10,
+                width=9,
             )
-            mode_combo.grid(row=row, column=2, padx=6)
+            mode_combo.grid(row=row, column=2, padx=4)
             mode_combo.bind(
                 "<<ComboboxSelected>>", lambda _event, idx=i: self._sync_multi_cyclic()
             )
-            position_entry = ttk.Entry(
-                params, textvariable=self.mn_position_vars[i], width=8, justify="right"
+            self._multi_slider_cell(
+                params, row, 3, self.mn_position_vars[i], *POSITION_LIMITS
             )
-            position_entry.grid(row=row, column=3, padx=6)
-            speed_entry = ttk.Entry(
-                params, textvariable=self.mn_speed_vars[i], width=6, justify="right"
+            self._multi_slider_cell(
+                params, row, 4, self.mn_speed_vars[i], *SPEED_LIMITS
             )
-            speed_entry.grid(row=row, column=4, padx=6)
-            iq_entry = ttk.Entry(
-                params, textvariable=self.mn_iq_vars[i], width=6, justify="right"
+            self._multi_slider_cell(
+                params, row, 5, self.mn_iq_vars[i], *IQ_LIMITS
             )
-            iq_entry.grid(row=row, column=5, padx=6)
-            for entry in (position_entry, speed_entry, iq_entry):
-                entry.bind("<Return>", lambda _event, idx=i: self._sync_multi_cyclic())
             ttk.Checkbutton(
                 params, variable=self.mn_active_vars[i], command=self._sync_multi_cyclic
-            ).grid(row=row, column=6, padx=6)
+            ).grid(row=row, column=6, padx=4)
         ttk.Label(
             params,
             text="参与下发的节点需从 Node 1 开始连续勾选；未参与的节点不会收到控制报文。",
             foreground="#555555",
-        ).grid(row=6, column=0, columnspan=7, sticky="w", padx=6, pady=(8, 0))
+        ).grid(row=6, column=0, columnspan=7, sticky="w", padx=4, pady=(8, 0))
 
         actions = ttk.Frame(tab)
         actions.grid(row=1, column=0, sticky="ew", padx=(0, 5), pady=(0, 8))
-        ttk.Button(actions, text="发送一次", command=self._multi_send_once).pack(
+        action_row1 = ttk.Frame(actions)
+        action_row1.pack(fill="x")
+        ttk.Button(action_row1, text="发送一次", command=self._multi_send_once).pack(
             side="left", padx=4
         )
         ttk.Button(
-            actions,
+            action_row1,
             text="立即下使能",
             style="Danger.TButton",
             command=self._multi_emergency_disable,
         ).pack(side="left", padx=4)
-        ttk.Button(actions, text="全选 1~5", command=self._multi_select_all).pack(
-            side="left", padx=8
-        )
-        ttk.Button(actions, text="仅 Node 1", command=self._multi_select_first).pack(
+        ttk.Button(
+            action_row1,
+            text="全部使能",
+            style="Success.TButton",
+            command=self._multi_enable_all,
+        ).pack(side="left", padx=4)
+        ttk.Button(action_row1, text="全选 1~5", command=self._multi_select_all).pack(
             side="left", padx=4
         )
+        ttk.Button(action_row1, text="仅 Node 1", command=self._multi_select_first).pack(
+            side="left", padx=4
+        )
+        action_row2 = ttk.Frame(actions)
+        action_row2.pack(fill="x", pady=(2, 0))
         ttk.Checkbutton(
-            actions,
+            action_row2,
             text="周期发送",
             variable=self.mn_cyclic_var,
             command=self._configure_multi_cyclic,
-        ).pack(side="left", padx=(20, 3))
+        ).pack(side="left", padx=(0, 3))
         ttk.Spinbox(
-            actions,
+            action_row2,
             from_=1,
             to=200,
             textvariable=self.mn_cyclic_ms_var,
             width=7,
             command=self._sync_multi_cyclic,
         ).pack(side="left", padx=3)
-        ttk.Label(actions, text="ms").pack(side="left")
+        ttk.Label(action_row2, text="ms").pack(side="left")
 
         monitor = ttk.LabelFrame(tab, text="多节点实时监控", padding=10)
         monitor.grid(row=0, column=1, rowspan=2, sticky="nsew", padx=(5, 0), pady=(0, 8))
@@ -448,15 +500,15 @@ class MotorHostApp(tk.Tk):
             "error": "故障",
         }
         widths = {
-            "node": 45,
-            "enable": 55,
-            "mode": 55,
-            "position": 65,
-            "speed": 50,
-            "iq": 45,
-            "voltage": 70,
-            "temp": 55,
-            "error": 80,
+            "node": 40,
+            "enable": 45,
+            "mode": 45,
+            "position": 55,
+            "speed": 40,
+            "iq": 40,
+            "voltage": 55,
+            "temp": 45,
+            "error": 70,
         }
         self.multi_status_table = ttk.Treeview(
             monitor, columns=columns, show="headings", height=7
@@ -639,6 +691,64 @@ class MotorHostApp(tk.Tk):
             wraplength=1000,
             foreground="#555555",
         ).pack(anchor="w", pady=12)
+
+        script = ttk.LabelFrame(tab, text="脚本调试（多条报文）", padding=10)
+        script.pack(fill="both", expand=True)
+        script.columnconfigure(0, weight=1)
+        script.columnconfigure(1, weight=1)
+        script.rowconfigure(0, weight=1)
+
+        script_panel = ttk.Frame(script)
+        script_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        script_panel.columnconfigure(0, weight=1)
+        script_panel.rowconfigure(0, weight=1)
+        self.script_text = scrolledtext.ScrolledText(
+            script_panel, height=12, font=("Consolas", 9), wrap="none"
+        )
+        self.script_text.grid(row=0, column=0, sticky="nsew")
+        script_actions = ttk.Frame(script_panel)
+        script_actions.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        ttk.Button(script_actions, text="执行脚本", command=self._run_raw_script).pack(
+            side="left", padx=4
+        )
+        ttk.Button(script_actions, text="清空脚本", command=self._clear_raw_script).pack(
+            side="left", padx=4
+        )
+        ttk.Label(script_actions, text="默认间隔").pack(side="left", padx=(16, 3))
+        ttk.Spinbox(
+            script_actions,
+            from_=0,
+            to=60000,
+            textvariable=self.script_interval_var,
+            width=7,
+        ).pack(side="left", padx=3)
+        ttk.Label(script_actions, text="ms").pack(side="left")
+        ttk.Label(
+            script_actions,
+            text="语法：MID + Data；MID ? 查询；delay 100 延时；# 注释",
+            foreground="#555555",
+        ).pack(side="left", padx=16)
+
+        response_panel = ttk.Frame(script)
+        response_panel.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+        response_panel.columnconfigure(0, weight=1)
+        response_panel.rowconfigure(1, weight=1)
+        ttk.Label(response_panel, text="多报文响应", style="Section.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+        self.raw_reply_text = scrolledtext.ScrolledText(
+            response_panel,
+            height=12,
+            font=("Consolas", 9),
+            wrap="none",
+            state="disabled",
+        )
+        self.raw_reply_text.grid(row=1, column=0, sticky="nsew", pady=(4, 0))
+        response_actions = ttk.Frame(response_panel)
+        response_actions.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        ttk.Button(
+            response_actions, text="清空响应", command=self._clear_raw_replies
+        ).pack(side="left", padx=4)
 
     def refresh_ports(self) -> None:
         values = [SIMULATOR_LABEL]
@@ -846,6 +956,11 @@ class MotorHostApp(tk.Tk):
             var.set(i == 0)
         self._sync_multi_cyclic()
 
+    def _multi_enable_all(self) -> None:
+        for var in self.mn_enable_vars:
+            var.set(True)
+        self._sync_multi_cyclic()
+
     def _multi_send_once(self) -> None:
         if not self._require_connected():
             return
@@ -1041,6 +1156,87 @@ class MotorHostApp(tk.Tk):
             return
         self.worker.submit("raw_query", mid)
 
+    @staticmethod
+    def _parse_raw_script(text: str, interval_ms: int) -> list[tuple]:
+        default_delay = max(0, int(interval_ms)) / 1000
+        steps: list[tuple] = []
+        pending_delay: float | None = None
+        seen_message = False
+        for line_no, raw_line in enumerate(text.splitlines(), start=1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            lower = line.lower()
+            if lower.startswith("delay ") or lower == "delay":
+                try:
+                    ms = int(line.split()[1], 0)
+                except (IndexError, ValueError) as exc:
+                    raise ProtocolError(f"第 {line_no} 行 delay 需要毫秒数") from exc
+                if not 0 <= ms <= 60000:
+                    raise ProtocolError(f"第 {line_no} 行 delay 必须在 0~60000 ms")
+                pending_delay = ms / 1000
+                continue
+            parts = line.split()
+            try:
+                mid = int(parts[0], 0)
+            except ValueError as exc:
+                raise ProtocolError(f"第 {line_no} 行 MID 无效：{parts[0]}") from exc
+            if not 0 <= mid <= 0x7FF:
+                raise ProtocolError(f"第 {line_no} 行 MID 必须位于 0x000~0x7FF")
+            if len(parts) >= 2 and parts[1] == "?":
+                if len(parts) != 2:
+                    raise ProtocolError(f"第 {line_no} 行查询报文只能包含 MID 和 ?")
+                step: tuple = ("query", mid)
+            else:
+                try:
+                    data = parse_hex_bytes(" ".join(parts[1:]))
+                except ProtocolError as exc:
+                    raise ProtocolError(f"第 {line_no} 行 Data 无效：{exc}") from exc
+                if not data:
+                    raise ProtocolError(f"第 {line_no} 行完整帧至少需要 1 字节 Data")
+                step = ("frame", mid, data)
+            delay = pending_delay if pending_delay is not None else default_delay
+            if (seen_message or pending_delay is not None) and delay > 0:
+                steps.append(("delay", delay))
+            pending_delay = None
+            steps.append(step)
+            seen_message = True
+        return steps
+
+    def _run_raw_script(self) -> None:
+        if not self._require_connected():
+            return
+        try:
+            interval = int(self.script_interval_var.get())
+            steps = self._parse_raw_script(self.script_text.get("1.0", "end-1c"), interval)
+        except (ValueError, tk.TclError, ProtocolError) as exc:
+            messagebox.showerror("脚本解析错误", str(exc))
+            return
+        if not steps:
+            messagebox.showwarning("脚本为空", "请先输入至少一条报文。")
+            return
+        self.worker.submit("raw_script", steps)
+        self._append_log(f"INFO 脚本已提交，共 {len(steps)} 步")
+
+    def _clear_raw_script(self) -> None:
+        self.script_text.delete("1.0", "end")
+
+    def _append_raw_reply(self, mid: int, data: bytes) -> None:
+        self.raw_reply_text.configure(state="normal")
+        self.raw_reply_text.insert(
+            "end", f"{time.strftime('%H:%M:%S')}  MID 0x{mid:03X}: {format_hex(data)}\n"
+        )
+        line_count = int(self.raw_reply_text.index("end-1c").split(".")[0])
+        if line_count > 1200:
+            self.raw_reply_text.delete("1.0", "200.0")
+        self.raw_reply_text.see("end")
+        self.raw_reply_text.configure(state="disabled")
+
+    def _clear_raw_replies(self) -> None:
+        self.raw_reply_text.configure(state="normal")
+        self.raw_reply_text.delete("1.0", "end")
+        self.raw_reply_text.configure(state="disabled")
+
     def _append_log(self, line: str) -> None:
         self.log_text.configure(state="normal")
         self.log_text.insert("end", line + "\n")
@@ -1165,6 +1361,7 @@ class MotorHostApp(tk.Tk):
                 elif kind == "raw_reply":
                     mid, data = payload
                     self.raw_reply_var.set(f"MID 0x{mid:03X}: {format_hex(data)}")
+                    self._append_raw_reply(mid, data)
                 elif kind == "baud_changed":
                     self.baud_var.set(str(payload))
                     self.baud_read_var.set(str(payload))
