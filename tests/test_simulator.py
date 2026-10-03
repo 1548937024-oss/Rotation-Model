@@ -6,17 +6,22 @@ import unittest
 from motor_protocol import (
     MAX_IQ_MA,
     MAX_SPEED_RPM,
+    POSITION_SOFT_MAX_COUNTS,
     MotorControl,
     build_clear_fault_service,
+    build_emergency_stop_service,
     build_frame,
     build_motor_enable_service,
+    build_normal_stop_service,
     build_query_frame,
+    build_quick_stop_service,
     build_read_did,
     build_reply_tail,
     build_reload_parameters,
     build_save_parameters,
     build_single_control_frame,
     build_write_did,
+    decode_did_value,
     parse_motion_status,
     parse_reply_tail,
     parse_service_response,
@@ -153,6 +158,110 @@ class SimulatorIntegrationTests(unittest.TestCase):
     def test_short_and_full_queries_both_work(self) -> None:
         short = parse_reply_tail(0x181, self._short_query(0x181))
         self.assertEqual(len(short), 5)
+
+    def test_normal_stop_decelerates_then_disables(self) -> None:
+        self.transport._zero_established = True
+        self.assertTrue(service(self.transport, build_motor_enable_service(True)).ok)
+        self.transport._apply_after = time.monotonic() - 0.001
+        self.transport._advance()
+        self.transport.write(build_single_control_frame(1, MotorControl(True, 1, 0, 60, 20)))
+        self.transport._apply_after = time.monotonic() - 0.001
+        self.transport._advance()
+        self.assertTrue(self.transport.enabled)
+
+        self.assertTrue(service(self.transport, build_normal_stop_service()).ok)
+        self.assertEqual(self.transport._stop_kind, 1)
+        self.assertTrue(self.transport._stop_active)
+        for _ in range(12):
+            self.transport._advance()
+        self.assertFalse(self.transport.enabled)
+
+    def test_quick_stop_disables_immediately(self) -> None:
+        self.transport._zero_established = True
+        service(self.transport, build_motor_enable_service(True))
+        self.assertTrue(self.transport.enabled)
+        self.assertTrue(service(self.transport, build_quick_stop_service()).ok)
+        self.assertFalse(self.transport.enabled)
+        self.assertEqual(self.transport._stop_kind, 2)
+
+    def test_emergency_stop_latches_until_clear_fault(self) -> None:
+        self.transport._zero_established = True
+        service(self.transport, build_motor_enable_service(True))
+        self.assertTrue(service(self.transport, build_emergency_stop_service()).ok)
+        self.assertTrue(self.transport._safety_latched)
+        flags = service(self.transport, build_read_did(0x2021, 0x02)).value
+        self.assertTrue(flags & 0x0040)
+
+        refused = service(self.transport, build_motor_enable_service(True))
+        self.assertFalse(refused.ok)
+        self.assertEqual(refused.return_code, 0xE5)
+
+        self.assertTrue(service(self.transport, build_clear_fault_service()).ok)
+        self.assertFalse(self.transport._safety_latched)
+        self.assertTrue(service(self.transport, build_motor_enable_service(True)).ok)
+
+    def test_control_frame_timeout_stops_and_disables(self) -> None:
+        self.transport._zero_established = True
+        service(self.transport, build_motor_enable_service(True))
+        self.transport._apply_after = time.monotonic() - 0.001
+        self.transport._advance()
+        self.assertTrue(self.transport.enabled)
+
+        # 模拟超过 200 ms 没有收到任何 Control1 / 0xF1 帧
+        self.transport._last_cmd_time = time.monotonic() - 0.5
+        for _ in range(12):
+            self.transport._advance()
+        self.assertFalse(self.transport.enabled)
+        self.assertTrue(self.transport._comm_lost)
+        flags = service(self.transport, build_read_did(0x2021, 0x02)).value
+        self.assertTrue(flags & 0x0010)
+
+    def test_control_frames_keep_watchdog_alive(self) -> None:
+        self.transport._zero_established = True
+        service(self.transport, build_motor_enable_service(True))
+        self.transport._last_cmd_time = time.monotonic() - 0.5
+        self.transport.write(build_single_control_frame(1, MotorControl(True, 1, 0, 10, 20)))
+        self.transport._advance()
+        self.assertTrue(self.transport.enabled)
+        self.assertFalse(self.transport._comm_lost)
+
+    def test_safety_config_read_write(self) -> None:
+        self.assertEqual(service(self.transport, build_read_did(0x2020, 0x03)).value, 200)
+        self.assertTrue(service(self.transport, build_write_did(0x2020, 0x03, 300)).ok)
+        self.assertEqual(service(self.transport, build_read_did(0x2020, 0x03)).value, 300)
+        out_of_range = service(self.transport, build_write_did(0x2020, 0x03, 10))
+        self.assertFalse(out_of_range.ok)
+        self.assertEqual(out_of_range.return_code, 0x06090030)
+
+    def test_soft_limit_write_requires_stopped_and_ordered(self) -> None:
+        raw_min = (-1000) & 0xFFFFFFFF
+        self.assertTrue(service(self.transport, build_write_did(0x2020, 0x01, raw_min)).ok)
+        read_back = service(self.transport, build_read_did(0x2020, 0x01)).value
+        self.assertEqual(decode_did_value(0x2020, 0x01, read_back), -1000)
+
+        # 软上限必须大于软下限
+        bad_max = service(self.transport, build_write_did(0x2020, 0x02, (-2000) & 0xFFFFFFFF))
+        self.assertFalse(bad_max.ok)
+        self.assertEqual(bad_max.return_code, 0x06090030)
+        self.assertEqual(
+            service(self.transport, build_read_did(0x2020, 0x02)).value,
+            POSITION_SOFT_MAX_COUNTS,
+        )
+
+        # 运行中拒绝写安全配置
+        self.transport._zero_established = True
+        service(self.transport, build_motor_enable_service(True))
+        refused = service(self.transport, build_write_did(0x2020, 0x03, 250))
+        self.assertFalse(refused.ok)
+        self.assertEqual(refused.return_code, 0x06010002)
+
+    def test_safety_status_did(self) -> None:
+        self.assertEqual(service(self.transport, build_read_did(0x2021, 0x03)).value, 0x00021003)
+        self.assertEqual(service(self.transport, build_read_did(0x2021, 0x06)).value, 0x00010400)
+        self.assertEqual(service(self.transport, build_read_did(0x2021, 0x01)).value, 0)
+        refused = service(self.transport, build_write_did(0x2021, 0x01, 1))
+        self.assertFalse(refused.ok)
+        self.assertEqual(refused.return_code, 0x06010002)
 
     def _short_query(self, mid: int) -> bytes:
         self.transport.write(bytes((0xAA, mid & 0xFF, (mid >> 8) & 0xFF)))

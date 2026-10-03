@@ -34,6 +34,15 @@ POSITION_MIN_LSB: Final[int] = -32768
 # 首次使能若未建零点会先做对齐，上位机需预留的时间
 ALIGNMENT_TIME_S: Final[float] = 1.2
 
+# 控制帧超时保护：使能后超过该时间没有合法 Control1 / 0xF1 帧，从机受控停车并下使能
+CONTROL_TIMEOUT_DEFAULT_MS: Final[int] = 200
+CONTROL_TIMEOUT_MIN_MS: Final[int] = 20
+CONTROL_TIMEOUT_MAX_MS: Final[int] = 5000
+
+# 位置软限位（编码器计），与 board_conf.h 的 BOARD_PROTO_POS_MIN/MAX_COUNTS 一致
+POSITION_SOFT_MIN_COUNTS: Final[int] = -2129920
+POSITION_SOFT_MAX_COUNTS: Final[int] = 2129855
+
 
 class ProtocolError(ValueError):
     """帧或信号不符合协议定义时抛出。"""
@@ -42,6 +51,48 @@ class ProtocolError(ValueError):
 class RunMode(IntEnum):
     POSITION = 0x00
     SPEED = 0x01
+
+
+class MotorConfigSub(IntEnum):
+    """0xF1 电机配置服务的子功能号。"""
+
+    ENABLE = 0x10
+    RUN_MODE = 0x11
+    CLEAR_FAULT = 0x12
+    STOP = 0x13
+    QUICK_STOP = 0x14
+    EMERGENCY_STOP = 0x15
+    SET_ZERO = 0xA2
+
+
+# 0x2021[01] MCU 状态机
+MCU_STATE_NAMES: Final[dict[int, str]] = {
+    0: "IDLE 空闲",
+    1: "START_RUN 启动",
+    2: "ALIGNMENT 对齐中",
+    3: "RUN 运行",
+    4: "FAULT_NOW 故障锁存",
+    5: "FAULT_OVER 故障确认/冷却",
+    6: "STOP_IDLE 停机",
+}
+
+# 0x2021[02] Safety flags
+SAFETY_FLAG_NAMES: Final[tuple[tuple[int, str], ...]] = (
+    (0, "已对齐"),
+    (1, "位置到位"),
+    (2, "故障锁存"),
+    (3, "总线控制已使能"),
+    (4, "通讯失联保护已触发"),
+    (5, "正在停车"),
+    (6, "急停锁存"),
+)
+
+# 0x2021[05] Last stop kind
+STOP_KIND_NAMES: Final[dict[int, str]] = {
+    0: "无",
+    1: "正常停车",
+    2: "快速停车/急停",
+}
 
 
 # Status1 Byte0 bit5:0 在有故障时表示错误码
@@ -341,6 +392,24 @@ def build_clear_fault_service() -> bytes:
     return _pad_service(bytes((0xF1, 0x12, 0x01)))
 
 
+def build_normal_stop_service() -> bytes:
+    """0xF1/0x13 正常停车：按当前模式减速到零，再关输出并下使能。"""
+
+    return _pad_service(bytes((0xF1, int(MotorConfigSub.STOP), 0x01)))
+
+
+def build_quick_stop_service() -> bytes:
+    """0xF1/0x14 快速停车：立即关输出并下使能。"""
+
+    return _pad_service(bytes((0xF1, int(MotorConfigSub.QUICK_STOP), 0x01)))
+
+
+def build_emergency_stop_service() -> bytes:
+    """0xF1/0x15 急停并锁存：立即关输出，锁存后必须 0xF1 0x12 清错才能重新使能。"""
+
+    return _pad_service(bytes((0xF1, int(MotorConfigSub.EMERGENCY_STOP), 0x01)))
+
+
 def build_save_parameters() -> bytes:
     """0x1010 保存参数到 EEPROM（要求电机未运行）。"""
 
@@ -427,6 +496,7 @@ class DidSpec:
     maximum: int = 0xFFFFFFFF
     default: int | None = None
     signed: bool = False
+    bits: int = 32
     note: str = ""
 
     @property
@@ -444,53 +514,86 @@ DID_CATALOG: Final[tuple[DidSpec, ...]] = (
     DidSpec(0x3001, 0x01, "当前波特率", "bit/s", writable=False, maximum=0xFFFFFFFF),
     DidSpec(
         0x6073, 0x00, "Max Iq Current", "mA", writable=False,
-        minimum=0, maximum=65535, note="只读，当前 1400 mA",
+        minimum=0, maximum=65535, bits=16, note="只读，当前 1400 mA",
     ),
     DidSpec(
         0x607F, 0x00, "Max Speed", "rpm", writable=False,
-        minimum=0, maximum=65535, note="只读，当前 18000 rpm",
+        minimum=0, maximum=65535, bits=16, note="只读，当前 18000 rpm",
     ),
     DidSpec(
         0x6073, 0x01, "堵转电流", "mA", writable=True,
-        minimum=0, maximum=3000, default=1500,
+        minimum=0, maximum=3000, default=1500, bits=16,
         note="写入 RAM；当前过流保护入口仍是硬件 OCP/nFAULT",
     ),
     DidSpec(
         0x6073, 0x03, "堵转时间", "ms", writable=True,
-        minimum=0, maximum=65535, default=1000,
+        minimum=0, maximum=65535, default=1000, bits=16,
     ),
     DidSpec(
         0x202D, 0x01, "欠压阈值", "0.1V", writable=True,
-        minimum=40, maximum=110, default=90,
+        minimum=40, maximum=110, default=90, bits=16,
     ),
     DidSpec(
         0x202D, 0x02, "欠压时间", "ms", writable=True,
-        minimum=0, maximum=10000, default=500,
+        minimum=0, maximum=10000, default=500, bits=16,
     ),
     DidSpec(
         0x202D, 0x03, "过压阈值", "0.1V", writable=True,
-        minimum=80, maximum=150, default=520,
+        minimum=80, maximum=150, default=520, bits=16,
     ),
     DidSpec(
         0x202D, 0x04, "过压时间", "ms", writable=True,
-        minimum=0, maximum=10000, default=500,
+        minimum=0, maximum=10000, default=500, bits=16,
     ),
     DidSpec(
         0x2016, 0x02, "过温阈值", "°C", writable=True,
-        minimum=55, maximum=110, default=90,
+        minimum=55, maximum=110, default=90, bits=16,
     ),
     DidSpec(
         0x2016, 0x03, "过温时间", "ms", writable=True,
-        minimum=0, maximum=60000, default=1000,
+        minimum=0, maximum=60000, default=1000, bits=16,
     ),
     DidSpec(
         0x2016, 0x04, "过温恢复", "°C", writable=True,
-        minimum=50, maximum=110, default=75,
+        minimum=50, maximum=110, default=75, bits=16,
     ),
-    DidSpec(0x2010, 0x01, "A 相电流", "mA", writable=False, signed=True, minimum=-32768, maximum=32767),
-    DidSpec(0x2010, 0x02, "B 相电流", "mA", writable=False, signed=True, minimum=-32768, maximum=32767),
-    DidSpec(0x2010, 0x03, "C 相电流", "mA", writable=False, signed=True, minimum=-32768, maximum=32767),
-    DidSpec(0x2010, 0x04, "相电流峰值", "mA", writable=False, minimum=0, maximum=65535),
+    # ---- 0x2020 安全配置（项目扩展，可读写；仅停机可写）----
+    DidSpec(
+        0x2020, 0x01, "位置软下限", "count", writable=True, signed=True,
+        minimum=POSITION_SOFT_MIN_COUNTS, maximum=POSITION_SOFT_MAX_COUNTS,
+        default=POSITION_SOFT_MIN_COUNTS,
+        note="必须小于位置软上限；仅停机可写，写 0x1010 保存",
+    ),
+    DidSpec(
+        0x2020, 0x02, "位置软上限", "count", writable=True, signed=True,
+        minimum=POSITION_SOFT_MIN_COUNTS, maximum=POSITION_SOFT_MAX_COUNTS,
+        default=POSITION_SOFT_MAX_COUNTS,
+        note="必须大于位置软下限；仅停机可写，写 0x1010 保存",
+    ),
+    DidSpec(
+        0x2020, 0x03, "控制帧超时", "ms", writable=True, bits=16,
+        minimum=CONTROL_TIMEOUT_MIN_MS, maximum=CONTROL_TIMEOUT_MAX_MS,
+        default=CONTROL_TIMEOUT_DEFAULT_MS,
+        note="使能后超时未收到 Control1/0xF1 帧，从机受控停车并下使能",
+    ),
+    # ---- 0x2021 安全状态（项目扩展，只读）----
+    DidSpec(0x2021, 0x01, "MCU 状态", "", writable=False, bits=16),
+    DidSpec(0x2021, 0x02, "安全状态标志", "", writable=False, bits=16),
+    DidSpec(0x2021, 0x03, "固件版本", "", writable=False),
+    DidSpec(0x2021, 0x04, "最近故障码", "", writable=False, bits=16),
+    DidSpec(0x2021, 0x05, "最近停车类型", "", writable=False, bits=16),
+    DidSpec(0x2021, 0x06, "协议版本", "", writable=False),
+    DidSpec(0x2021, 0x07, "故障快照码", "", writable=False, bits=16),
+    DidSpec(0x2021, 0x08, "故障快照时间", "ms", writable=False),
+    DidSpec(0x2021, 0x09, "故障快照母线", "mV", writable=False),
+    DidSpec(0x2021, 0x0A, "故障快照转速", "rpm", writable=False, signed=True),
+    DidSpec(0x2021, 0x0B, "故障快照 Iq 给定", "mA", writable=False, signed=True),
+    DidSpec(0x2021, 0x0C, "故障快照位置", "count", writable=False, signed=True),
+    DidSpec(0x2021, 0x0D, "故障快照模式", "", writable=False, bits=16),
+    DidSpec(0x2010, 0x01, "A 相电流", "mA", writable=False, signed=True, bits=16, minimum=-32768, maximum=32767),
+    DidSpec(0x2010, 0x02, "B 相电流", "mA", writable=False, signed=True, bits=16, minimum=-32768, maximum=32767),
+    DidSpec(0x2010, 0x03, "C 相电流", "mA", writable=False, signed=True, bits=16, minimum=-32768, maximum=32767),
+    DidSpec(0x2010, 0x04, "相电流峰值", "mA", writable=False, bits=16, minimum=0, maximum=65535),
     DidSpec(0x2015, 0x01, "编码器累计", "count", writable=False, signed=True, minimum=-2147483648, maximum=2147483647),
     DidSpec(0x2015, 0x02, "编码器 Z 计数", "count", writable=False, minimum=0, maximum=0xFFFFFFFF),
 )
@@ -499,25 +602,77 @@ DID_BY_KEY: Final[dict[tuple[int, int], DidSpec]] = {spec.key: spec for spec in 
 
 
 def decode_did_value(did: int, sub_id: int, raw_u32: int) -> int:
-    """按 DID 类型解释响应中的 32 位值（S16/S32 需要符号扩展）。"""
+    """按 DID 目录的位宽与符号属性解释响应里的 32 位值。"""
 
     spec = DID_BY_KEY.get((did, sub_id))
-    value = raw_u32 & 0xFFFFFFFF
+    value = int(raw_u32) & 0xFFFFFFFF
     if spec is None:
         return value
-    if spec.signed and spec.did == 0x2015:
-        return value - 0x100000000 if value & 0x80000000 else value
-    if spec.signed and spec.did == 0x2010:
-        value &= 0xFFFF
-        return value - 0x10000 if value & 0x8000 else value
+    bits = spec.bits if spec.bits in (16, 32) else 32
+    value &= (1 << bits) - 1
+    if spec.signed and value & (1 << (bits - 1)):
+        value -= 1 << bits
     return value
+
+
+def mcu_state_name(value: int) -> str:
+    return MCU_STATE_NAMES.get(int(value), f"未知状态 {int(value)}")
+
+
+def safety_flags_list(flags: int) -> list[str]:
+    flags = int(flags)
+    return [name for bit, name in SAFETY_FLAG_NAMES if flags & (1 << bit)]
+
+
+def safety_flags_text(flags: int) -> str:
+    names = safety_flags_list(flags)
+    return "、".join(names) if names else "无"
+
+
+def stop_kind_name(value: int) -> str:
+    return STOP_KIND_NAMES.get(int(value), f"未知 {int(value)}")
+
+
+def fault_code_name(code: int) -> str:
+    code = int(code)
+    if code == 0:
+        return "无故障"
+    return ERROR_CODE_NAMES.get(code, f"未知故障码 {code}")
+
+
+def _bcd_byte(value: int) -> int | None:
+    high, low = (value >> 4) & 0xF, value & 0xF
+    if high > 9 or low > 9:
+        return None
+    return high * 10 + low
+
+
+def format_version(value: int) -> str:
+    """固件/协议版本按 BCD 字节显示，例如 0x00021003 -> V2.10.3。"""
+
+    raw = int(value) & 0xFFFFFFFF
+    parts = (_bcd_byte((raw >> 16) & 0xFF), _bcd_byte((raw >> 8) & 0xFF), _bcd_byte(raw & 0xFF))
+    if all(part is not None for part in parts):
+        return f"V{parts[0]}.{parts[1]}.{parts[2]}"
+    return f"0x{raw:08X}"
 
 
 def format_did_value(did: int, sub_id: int, raw_u32: int) -> str:
     spec = DID_BY_KEY.get((did, sub_id))
     value = decode_did_value(did, sub_id, raw_u32)
-    if spec and spec.did == 0x1018:
+    key = (did, sub_id)
+    if key == (0x1018, 0x04):
         return f"0x{value & 0xFFFFFFFF:08X}"
+    if key in ((0x2021, 0x03), (0x2021, 0x06)):
+        return format_version(value)
+    if key == (0x2021, 0x01):
+        return mcu_state_name(value)
+    if key == (0x2021, 0x02):
+        return f"0x{value:04X}（{safety_flags_text(value)}）"
+    if key in ((0x2021, 0x04), (0x2021, 0x07)):
+        return fault_code_name(value)
+    if key == (0x2021, 0x05):
+        return stop_kind_name(value)
     if spec and spec.unit:
         return f"{value} {spec.unit}"
     return str(value)

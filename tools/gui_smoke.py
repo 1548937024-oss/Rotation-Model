@@ -62,6 +62,15 @@ def main() -> int:
     checks["max_iq_after_reload"] = app.max_iq_var.get()
     checks["max_speed_after_reload"] = app.max_speed_var.get()
 
+    # 0x2020/03 控制帧超时 + 0x2021 安全状态
+    app.worker.submit("read_safety")
+    pump(app, 8.0)
+    checks["control_timeout"] = app.control_timeout_var.get()
+    checks["mcu_state"] = app.safety_vars["state"].get()
+    checks["safety_flags"] = app.safety_vars["flags"].get()
+    checks["safety_fw"] = app.safety_vars["fw"].get()
+    checks["safety_proto"] = app.safety_vars["proto"].get()
+
     for key, value in checks.items():
         print(f"{key} = {value}")
 
@@ -75,6 +84,9 @@ def main() -> int:
         and checks["error"] == "无故障"
         and checks["max_iq_after_reload"].startswith("1400")
         and checks["max_speed_after_reload"].startswith("18000")
+        and checks["control_timeout"] == "200 ms"
+        and checks["safety_fw"].startswith("V2.10")
+        and checks["safety_proto"].startswith("V1.4")
     )
     print("UI SMOKE OK" if ok else "UI SMOKE FAILED")
     return 0 if ok else 1

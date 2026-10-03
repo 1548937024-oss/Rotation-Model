@@ -18,10 +18,13 @@ from motor_protocol import (
     MotorControl,
     ProtocolError,
     build_clear_fault_service,
+    build_emergency_stop_service,
     build_frame,
     build_motor_enable_service,
+    build_normal_stop_service,
     build_query,
     build_query_frame,
+    build_quick_stop_service,
     build_read_did,
     build_reload_parameters,
     build_run_mode_service,
@@ -70,6 +73,11 @@ TELEMETRY_DIDS: tuple[tuple[int, int], ...] = (
     (0x2010, 0x04),
     (0x2015, 0x01),
     (0x2015, 0x02),
+)
+
+# 0x2021 安全状态子项
+SAFETY_DIDS: tuple[tuple[int, int], ...] = tuple(
+    (0x2021, sub) for sub in range(0x01, 0x0E)
 )
 
 
@@ -139,14 +147,14 @@ class DeviceWorker:
 
     def _collect_reply(
         self, mid: int, expected_dlen: int | None, deadline: float
-    ) -> tuple[bytes, int]:
+    ) -> tuple[bytes, int, bytes]:
         """在字节流中按预期 DLEN 重新同步，并用 CRC 确认候选应答。
 
         从机应答尾没有 Header/MID，一旦错位只能靠 CRC 恢复。这里维护一个滚动窗口：
 
         * 只在字节等于预期 DLEN 的位置尝试解析（未知 MID 时接受合法 DLEN 范围）；
         * 长度足够后先做 CRC，失败就右移一个字节继续找；
-        * 返回 Data 与被丢弃的字节数，供上层记录错位统计。
+        * 返回 Data、被丢弃的字节数与命中帧的原始字节，供上层记录日志与错位统计。
 
         这样启动窗口里读到的 0x84 之类字节会被当作噪声丢弃，而不是当成非法 DLEN 直接报错。
         """
@@ -186,7 +194,7 @@ class DeviceWorker:
                     discarded += 1
                     continue
                 del buffer[:total]
-                return data, discarded
+                return data, discarded, candidate
             # 已确认的噪声字节及时释放，避免窗口无限增长
             if position > 256:
                 del buffer[:position]
@@ -233,12 +241,13 @@ class DeviceWorker:
             query = build_query(mid) if short else build_query_frame(mid)
             self._write(query, note or f"查询 MID 0x{mid:03X}")
             try:
-                data, discarded = self._collect_reply(
+                data, discarded, raw = self._collect_reply(
                     mid, expect_dlen, time.monotonic() + REPLY_TIMEOUT_S
                 )
             except TimeoutError as exc:
                 last_error = exc
                 continue
+            self._log("RX", raw, f"MID 0x{mid:03X} 的应答尾")
             if discarded:
                 self._emit(
                     "resync",
@@ -266,7 +275,7 @@ class DeviceWorker:
 
     # ---------------------------------------------------------------- 服务请求
 
-    def _service(self, payload: bytes, note: str = "服务请求") -> Any:
+    def _service(self, payload: bytes, note: str = "服务请求", *, quiet: bool = False) -> Any:
         """发送 SvcRequest 并接收固件主动下发的 SvcResponse。
 
         固件 `proto_handle_svc()` 解析完请求后立即 `proto_send(0x580+NID, …)`，
@@ -275,6 +284,7 @@ class DeviceWorker:
         旧 V1.2 上位机的"查询式"流程会先清掉刚到达的正确应答，导致 read did 失败。
 
         等待窗口覆盖 USB-RS485 的 16 ms 延迟定时器；超时才重发请求，最多 1+2 次。
+        `quiet=True` 时不发 service 事件，用于安全状态这类连续多次读取。
         """
 
         request_mid = 0x600 + self.node_id
@@ -284,7 +294,7 @@ class DeviceWorker:
             self._drain_input()
             self._write(build_frame(request_mid, payload), note)
             try:
-                data, discarded = self._collect_reply(
+                data, discarded, raw = self._collect_reply(
                     response_mid,
                     SERVICE_DLEN,
                     time.monotonic() + self.service_timeout_s,
@@ -292,10 +302,12 @@ class DeviceWorker:
             except TimeoutError as exc:
                 last_error = exc
                 continue
+            self._log("RX", raw, "MID 0x581 的应答尾")
             if discarded:
                 self._emit("resync", (response_mid, discarded, attempt))
             response = parse_service_response(data)
-            self._emit("service", response)
+            if not quiet:
+                self._emit("service", response)
             return response
 
         if SERVICE_QUERY_FALLBACK:
@@ -303,13 +315,41 @@ class DeviceWorker:
                 response_mid, "查询服务响应", expect_dlen=SERVICE_DLEN, attempts=2
             )
             response = parse_service_response(data)
-            self._emit("service", response)
+            if not quiet:
+                self._emit("service", response)
             return response
         raise last_error or TimeoutError("未收到服务响应")
 
     def _read_did(self, did: int, sub_id: int, note: str = "") -> Any:
         label = note or f"读取 DID 0x{did:04X}/{sub_id}"
         return self._service(build_read_did(did, sub_id), label)
+
+    def _read_did_value(self, did: int, sub_id: int, *, quiet: bool = False) -> int | None:
+        """读取并按 DID 位宽/符号解码；失败返回 None。"""
+
+        response = self._service(
+            build_read_did(did, sub_id),
+            f"读取 DID 0x{did:04X}/{sub_id:02X}",
+            quiet=quiet,
+        )
+        if not response.ok or response.value is None:
+            return None
+        return decode_did_value(did, sub_id, response.value)
+
+    def _read_safety(self) -> None:
+        """读取 0x2021 安全状态，合并为一个 safety 事件（不刷屏 service 事件）。"""
+
+        values: dict[tuple[int, int], int] = {}
+        failures: list[str] = []
+        for did, sub_id in SAFETY_DIDS:
+            value = self._read_did_value(did, sub_id, quiet=True)
+            if value is None:
+                failures.append(f"0x{did:04X}/{sub_id:02X}")
+                continue
+            values[(did, sub_id)] = value
+        if failures:
+            self._emit("warning", "安全状态读取失败：" + "，".join(failures))
+        self._emit("safety", values)
 
     def _read_telemetry(self) -> None:
         """读取 0x2010 / 0x2015 扩展遥测，返回原始值供界面换算与滤波。"""
@@ -513,6 +553,8 @@ class DeviceWorker:
             self.cyclic_interval = max(0.001, float(args[2]))
             if not was_enabled and self.cyclic_enabled:
                 self._next_control = time.monotonic()
+        elif name == "stop_cyclic":
+            self.cyclic_enabled = False
         elif name == "configure_poll":
             self.poll_enabled = bool(args[0])
             self.poll_interval = max(0.005, float(args[1]))
@@ -527,6 +569,19 @@ class DeviceWorker:
             self._service(build_run_mode_service(int(args[0])), "0xF1 运行模式")
         elif name == "clear_fault":
             self._service(build_clear_fault_service(), "0xF1 清错")
+        elif name == "stop":
+            self._service(build_normal_stop_service(), "0xF1 0x13 正常停车")
+        elif name == "quick_stop":
+            self._service(build_quick_stop_service(), "0xF1 0x14 快速停车")
+        elif name == "emergency_stop":
+            self._service(build_emergency_stop_service(), "0xF1 0x15 急停并锁存")
+            self.cyclic_enabled = False
+            self.latest_control = MotorControl(
+                False, self.latest_control.mode, self.latest_control.target_position, 0, 0
+            )
+            self._emit("disabled", None)
+        elif name == "read_safety":
+            self._read_safety()
         elif name == "save_parameters":
             self._service(build_save_parameters(), "保存参数到 EEPROM (0x1010)")
         elif name == "reload_parameters":

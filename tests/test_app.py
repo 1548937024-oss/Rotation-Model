@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 
+import app as app_module
 from app import (
     COMMON_BAUDRATES,
     IQ_LIMITS,
@@ -50,6 +51,39 @@ class ControlUiTests(unittest.TestCase):
         self.assertFalse(DID_BY_KEY[(0x607F, 0x00)].writable)
         self.assertIn((0x6073, 0x01), DID_BY_KEY)
         self.assertIn((0x2016, 0x04), DID_BY_KEY)
+
+    def test_safety_config_entries_are_present(self) -> None:
+        self.assertTrue(DID_BY_KEY[(0x2020, 0x01)].writable)
+        self.assertTrue(DID_BY_KEY[(0x2020, 0x02)].writable)
+        self.assertTrue(DID_BY_KEY[(0x2020, 0x03)].writable)
+        self.assertFalse(DID_BY_KEY[(0x2021, 0x02)].writable)
+
+    def test_safe_config_cross_check(self) -> None:
+        class VariableStub:
+            def __init__(self, value: str) -> None:
+                self.value = value
+
+            def get(self) -> str:
+                return self.value
+
+        class Stub:
+            param_vars = {
+                (0x2020, 0x01): VariableStub("-1000"),
+                (0x2020, 0x02): VariableStub("2000"),
+            }
+            _check_safe_config = MotorHostApp._check_safe_config
+
+        original = app_module.messagebox.showerror
+        app_module.messagebox.showerror = lambda *args, **kwargs: None
+        try:
+            stub = Stub()
+            self.assertTrue(stub._check_safe_config((0x2020, 0x01), -2000))
+            self.assertFalse(stub._check_safe_config((0x2020, 0x01), 3000))
+            self.assertFalse(stub._check_safe_config((0x2020, 0x02), -5000))
+            self.assertTrue(stub._check_safe_config((0x2020, 0x02), 3000))
+            self.assertTrue(stub._check_safe_config((0x2020, 0x03), 200))
+        finally:
+            app_module.messagebox.showerror = original
 
 
 class RawScriptParserTests(unittest.TestCase):

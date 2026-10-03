@@ -1,7 +1,7 @@
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(2, 10, 0, 0),
-    prodvers=(2, 10, 0, 0),
+    filevers=(2, 11, 0, 0),
+    prodvers=(2, 11, 0, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -15,13 +15,13 @@ VSVersionInfo(
         u'080404B0',
         [
           StringStruct(u'CompanyName', u''),
-          StringStruct(u'FileDescription', u'外置驱动器 MicroDriver V2.10 上位机'),
-          StringStruct(u'FileVersion', u'2.10.0.0'),
+          StringStruct(u'FileDescription', u'外置驱动器 MicroDriver V2.10 上位机（协议 V1.4）'),
+          StringStruct(u'FileVersion', u'2.11.0.0'),
           StringStruct(u'InternalName', u'MicroDriverHost'),
           StringStruct(u'LegalCopyright', u''),
           StringStruct(u'OriginalFilename', u'外置驱动器上位机.exe'),
           StringStruct(u'ProductName', u'外置驱动器 MicroDriver 上位机'),
-          StringStruct(u'ProductVersion', u'2.10.0.0')
+          StringStruct(u'ProductVersion', u'2.11.0.0')
         ]
       )
     ]),

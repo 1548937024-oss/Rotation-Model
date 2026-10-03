@@ -21,24 +21,33 @@ from typing import Callable
 from device_worker import SIMULATOR_PORT, DeviceWorker
 from motor_protocol import (
     ALIGNMENT_TIME_S,
+    CONTROL_TIMEOUT_DEFAULT_MS,
     DEFAULT_BAUDRATE,
     DEFAULT_NODE_ID,
     DID_CATALOG,
     DID_BY_KEY,
     MAX_IQ_MA,
     MAX_SPEED_RPM,
+    POSITION_SOFT_MAX_COUNTS,
+    POSITION_SOFT_MIN_COUNTS,
     DeviceStatus,
     MotionStatus,
     MotorControl,
     ProtocolError,
     RunMode,
+    decode_did_value,
+    fault_code_name,
     format_hex,
+    format_version,
+    mcu_state_name,
     parse_hex_bytes,
+    safety_flags_text,
+    stop_kind_name,
 )
 from signal_filter import DisplayFilters
 
 
-APP_VERSION = "V2.10"
+APP_VERSION = "V2.11"
 SIMULATOR_LABEL = "模拟设备（无需硬件）"
 COMMON_BAUDRATES = ("460800", "921600", "230400", "115200", "57600", "38400", "19200", "9600")
 POSITION_LIMITS = (-32768, 32767)
@@ -65,6 +74,21 @@ TELEMETRY_ROWS = (
     ("peak", "相电流峰值"),
     ("enc_total", "编码器累计"),
     ("enc_z", "编码器 Z 计数"),
+)
+SAFETY_ROWS = (
+    ("state", "MCU 状态"),
+    ("flags", "安全标志"),
+    ("fw", "固件版本"),
+    ("proto", "协议版本"),
+    ("fault", "最近故障码"),
+    ("stop", "最近停车"),
+    ("snap_code", "快照故障码"),
+    ("snap_time", "快照时间"),
+    ("snap_vbus", "快照母线"),
+    ("snap_rpm", "快照转速"),
+    ("snap_iq", "快照 Iq 给定"),
+    ("snap_pos", "快照位置"),
+    ("snap_mode", "快照模式"),
 )
 
 
@@ -138,7 +162,10 @@ class MotorHostApp(tk.Tk):
 
         self.status_vars = {key: tk.StringVar(value="--") for key, _ in STATUS_ROWS}
         self.telemetry_vars = {key: tk.StringVar(value="--") for key, _ in TELEMETRY_ROWS}
+        self.safety_vars = {key: tk.StringVar(value="--") for key, _ in SAFETY_ROWS}
         self.error_style_var = tk.StringVar(value="尚未查询")
+        self.control_timeout_ms = CONTROL_TIMEOUT_DEFAULT_MS
+        self.control_timeout_var = tk.StringVar(value=f"{CONTROL_TIMEOUT_DEFAULT_MS} ms")
 
         self.uid_var = tk.StringVar(value="--")
         self.baud_read_var = tk.StringVar(value="--")
@@ -280,23 +307,42 @@ class MotorHostApp(tk.Tk):
             side="left", padx=3
         )
 
+        stop_row = ttk.Frame(control)
+        stop_row.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(0, 6))
+        ttk.Button(stop_row, text="正常停车 (0x13)", command=self._normal_stop).pack(
+            side="left", padx=3
+        )
+        ttk.Button(stop_row, text="快速停车 (0x14)", command=self._quick_stop).pack(
+            side="left", padx=3
+        )
+        ttk.Button(
+            stop_row, text="急停并锁存 (0x15)", style="Danger.TButton", command=self._emergency_stop
+        ).pack(side="left", padx=3)
+        ttk.Label(stop_row, text="控制帧超时").pack(side="left", padx=(14, 3))
+        ttk.Label(stop_row, textvariable=self.control_timeout_var, style="Value.TLabel").pack(
+            side="left"
+        )
+        ttk.Button(stop_row, text="读取安全状态", command=self._read_safety).pack(
+            side="left", padx=(14, 3)
+        )
+
         ttk.Checkbutton(
             control, text="Control1 使能位", variable=self.enable_var, command=self._sync_cyclic
-        ).grid(row=1, column=0, sticky="w", padx=5, pady=6)
+        ).grid(row=2, column=0, sticky="w", padx=5, pady=6)
         mode_combo = ttk.Combobox(
             control, textvariable=self.mode_var, values=("位置模式", "速度模式"),
             state="readonly", width=12,
         )
-        ttk.Label(control, text="运行模式").grid(row=1, column=1, sticky="e", padx=4)
-        mode_combo.grid(row=1, column=2, sticky="w", padx=5)
+        ttk.Label(control, text="运行模式").grid(row=2, column=1, sticky="e", padx=4)
+        mode_combo.grid(row=2, column=2, sticky="w", padx=5)
         mode_combo.bind("<<ComboboxSelected>>", lambda _event: self._sync_cyclic())
 
-        self._labeled_slider(control, 2, "目标位置", self.position_var, *POSITION_LIMITS, "LSB（int16）")
-        self._labeled_slider(control, 3, "目标速度", self.speed_var, *SPEED_LIMITS, "% 额定转速")
-        self._labeled_slider(control, 4, "目标 Iq 限幅", self.iq_var, *IQ_LIMITS, "% Max Iq")
+        self._labeled_slider(control, 3, "目标位置", self.position_var, *POSITION_LIMITS, "LSB（int16）")
+        self._labeled_slider(control, 4, "目标速度", self.speed_var, *SPEED_LIMITS, "% 额定转速")
+        self._labeled_slider(control, 5, "目标 Iq 限幅", self.iq_var, *IQ_LIMITS, "% Max Iq")
 
         buttons = ttk.Frame(control)
-        buttons.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(8, 3))
+        buttons.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(8, 3))
         ttk.Button(buttons, text="发送一次", command=self._send_control).pack(side="left", padx=4)
         ttk.Button(
             buttons, text="立即下使能", style="Danger.TButton", command=self._emergency_disable
@@ -311,7 +357,7 @@ class MotorHostApp(tk.Tk):
         ttk.Label(buttons, text="ms").pack(side="left")
 
         notes = ttk.LabelFrame(control, text="协议要点", padding=8)
-        notes.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        notes.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(10, 0))
         ttk.Label(
             notes,
             justify="left",
@@ -320,7 +366,8 @@ class MotorHostApp(tk.Tk):
                 "1. Control1 没有应答，请用 Status1 确认执行结果。\n"
                 "2. 首次使能若未建零点，固件会先做约 1200 ms 对齐，对齐期间仍可查询状态。\n"
                 "3. TargetIq=0 表示回落到固件默认 1400 mA 限幅，不是零电流；本界面下限为 1%。\n"
-                "4. 清错后建议等待 ≥10 ms，再重新使能。"
+                "4. 使能后必须持续发送 Control1 / 0xF1 帧；超过控制帧超时会受控停车并下使能。\n"
+                "5. 急停 0x15 会锁存安全状态，必须 0xF1 0x12 清错后才能重新使能。"
             ),
         ).pack(anchor="w")
 
@@ -351,8 +398,21 @@ class MotorHostApp(tk.Tk):
             row=2, column=0, columnspan=6, sticky="e", padx=4, pady=(4, 0)
         )
 
+        safety = ttk.LabelFrame(status, text="安全状态（0x2021）", padding=8)
+        safety.grid(row=3, column=0, sticky="ew", pady=(2, 6))
+        for index, (key, label) in enumerate(SAFETY_ROWS):
+            ttk.Label(safety, text=label).grid(
+                row=index // 2, column=(index % 2) * 2, sticky="w", padx=4, pady=2
+            )
+            ttk.Label(safety, textvariable=self.safety_vars[key], style="Value.TLabel").grid(
+                row=index // 2, column=(index % 2) * 2 + 1, sticky="w", padx=(0, 12)
+            )
+        ttk.Button(safety, text="读取安全状态", command=self._read_safety).grid(
+            row=(len(SAFETY_ROWS) + 1) // 2, column=0, columnspan=4, sticky="e", padx=4, pady=(4, 0)
+        )
+
         polling = ttk.Frame(status)
-        polling.grid(row=3, column=0, sticky="ew", pady=(4, 0))
+        polling.grid(row=4, column=0, sticky="ew", pady=(4, 0))
         ttk.Checkbutton(
             polling, text="自动查询", variable=self.poll_var, command=self._configure_poll
         ).pack(side="left", padx=4)
@@ -363,7 +423,7 @@ class MotorHostApp(tk.Tk):
         ttk.Button(polling, text="立即查询", command=self._query_status).pack(side="left", padx=12)
 
         filtering = ttk.Frame(status)
-        filtering.grid(row=4, column=0, sticky="ew", pady=(4, 0))
+        filtering.grid(row=5, column=0, sticky="ew", pady=(4, 0))
         ttk.Checkbutton(
             filtering, text="显示滤波", variable=self.filter_var, command=self._apply_filter_settings
         ).pack(side="left", padx=(4, 8))
@@ -648,6 +708,11 @@ class MotorHostApp(tk.Tk):
             messagebox.showerror("控制参数错误", str(exc))
             return
         if self._confirm_enable(control.enable):
+            if control.enable and not self.cyclic_var.get():
+                if not self._ask_control_stream("发送使能控制帧"):
+                    self._append_log(
+                        "WARN 单次使能控制帧之后没有后续帧，从机将按控制帧超时保护停车"
+                    )
             self.worker.submit("send_control", control)
 
     def _emergency_disable(self) -> None:
@@ -697,14 +762,80 @@ class MotorHostApp(tk.Tk):
     def _motor_enable_service(self, enable: bool) -> None:
         if not self._require_connected():
             return
-        if enable and not self._confirm_enable(True):
+        if not enable:
+            self.enable_var.set(False)
+            self.worker.submit("motor_enable", False)
+            self.after(300, self._read_safety)
             return
-        self.enable_var.set(enable)
-        self.worker.submit("motor_enable", enable)
-        if enable:
-            self._align_notice_until = time.monotonic() + ALIGNMENT_TIME_S + 0.2
-            self.error_style_var.set("已发送使能；若首次对齐约 1.2 s，请观察 Status1")
-            self.error_label.configure(style="Warn.TLabel")
+        if not self._confirm_enable(True):
+            return
+        self.enable_var.set(True)
+        auto_stream = self._ask_control_stream("上使能")
+        self.worker.submit("motor_enable", True)
+        self._align_notice_until = time.monotonic() + ALIGNMENT_TIME_S + 0.2
+        self.error_style_var.set("已发送使能；若首次对齐约 1.2 s，请观察 Status1")
+        self.error_label.configure(style="Warn.TLabel")
+        if not auto_stream:
+            self._append_log("WARN 未开启周期发送：从机将按控制帧超时保护受控停车并下使能")
+        self.after(700, self._read_safety)
+
+    def _ask_control_stream(self, action: str) -> bool:
+        """使能后固件要求持续控制帧，询问是否自动开启 20 ms 周期发送。"""
+
+        if self.cyclic_var.get():
+            return True
+        if not messagebox.askyesno(
+            "需要持续控制帧",
+            f"{action}后，从机监测 Control1 / 0xF1 帧；\n"
+            f"超过 {self.control_timeout_ms} ms（0x2020/03 当前值）没有新帧，"
+            "从机会受控停车并下使能。\n\n是否自动开启 20 ms 周期发送？",
+            icon="warning",
+        ):
+            return False
+        self.cyclic_ms_var.set(20)
+        self.cyclic_var.set(True)
+        self._configure_cyclic()
+        return True
+
+    def _stop_cyclic(self) -> None:
+        """只停周期发送，不再补发 Control1，避免与 0xF1 停车服务冲突。"""
+
+        self.cyclic_var.set(False)
+        self.worker.submit("stop_cyclic")
+
+    def _normal_stop(self) -> None:
+        if not self._require_connected():
+            return
+        self._stop_cyclic()
+        self.worker.submit("stop")
+        self.after(900, self._read_safety)
+
+    def _quick_stop(self) -> None:
+        if not self._require_connected():
+            return
+        self._stop_cyclic()
+        self.worker.submit("quick_stop")
+        self.after(400, self._read_safety)
+
+    def _emergency_stop(self) -> None:
+        if not self._require_connected():
+            return
+        if not messagebox.askyesno(
+            "确认急停",
+            "将立即关闭输出并锁存安全状态。\n"
+            "锁存后 Control1 使能与 0xF1 0x10 使能都会被拒绝，必须清错后才能恢复。\n"
+            "是否继续？",
+            icon="warning",
+        ):
+            return
+        self.enable_var.set(False)
+        self._stop_cyclic()
+        self.worker.submit("emergency_stop")
+        self.after(400, self._read_safety)
+
+    def _read_safety(self) -> None:
+        if self._require_connected():
+            self.worker.submit("read_safety")
 
     def _apply_run_mode(self) -> None:
         if not self._require_connected():
@@ -717,9 +848,11 @@ class MotorHostApp(tk.Tk):
             return
         if messagebox.askyesno(
             "确认清错",
-            "将发送 0xF1 0x12 清错，等待 ≥10 ms 后再重新使能。是否继续？",
+            "将发送 0xF1 0x12 清错（同时解除急停锁存与通讯失联标志）。\n"
+            "等待 ≥10 ms 后再重新使能。是否继续？",
         ):
             self.worker.submit("clear_fault")
+            self.after(400, self._read_safety)
 
     # ------------------------------------------------------------------ 查询
 
@@ -792,10 +925,41 @@ class MotorHostApp(tk.Tk):
                 "参数错误", f"{spec.name} 必须位于 [{spec.minimum}, {spec.maximum}]"
             )
             return
-        if messagebox.askyesno("确认写入", f"确认写入 {spec.name} = {value} {spec.unit}？"):
+        if spec.did == 0x2020 and not self._check_safe_config(key, value):
+            return
+        encoded = value & 0xFFFFFFFF
+        extra = "\n\n安全配置仅允许在电机停止时写入。" if spec.did == 0x2020 else ""
+        if messagebox.askyesno(
+            "确认写入", f"确认写入 {spec.name} = {value} {spec.unit}？{extra}"
+        ):
             self.worker.submit(
-                "write_did", spec.did, spec.sub, value, f"写入 {spec.name} (0x{spec.did:04X}/{spec.sub:02X})"
+                "write_did",
+                spec.did,
+                spec.sub,
+                encoded,
+                f"写入 {spec.name} (0x{spec.did:04X}/{spec.sub:02X})",
             )
+
+    def _check_safe_config(self, key: tuple[int, int], value: int) -> bool:
+        """0x2020 软限位需要交叉校验，避免下发被固件拒绝的组合。"""
+
+        def current(sub: int, fallback: int) -> int:
+            try:
+                return int(self.param_vars[(0x2020, sub)].get(), 0)
+            except (KeyError, ValueError, tk.TclError):
+                return fallback
+
+        if key == (0x2020, 0x01):
+            other = current(0x02, POSITION_SOFT_MAX_COUNTS)
+            if value >= other:
+                messagebox.showerror("参数错误", f"位置软下限必须小于软上限 {other}")
+                return False
+        elif key == (0x2020, 0x02):
+            other = current(0x01, POSITION_SOFT_MIN_COUNTS)
+            if value <= other:
+                messagebox.showerror("参数错误", f"位置软上限必须大于软下限 {other}")
+                return False
+        return True
 
     def _save_parameters(self) -> None:
         if not self._require_connected():
@@ -1028,6 +1192,38 @@ class MotorHostApp(tk.Tk):
             unit = "count" if did == 0x2015 else "mA"
             self.telemetry_vars[key].set(f"{value} {unit}")
 
+    def _update_safety(self, values: dict[tuple[int, int], int]) -> None:
+        """刷新 0x2021 安全状态面板。"""
+
+        if not values:
+            self._append_log("WARN 未读到安全状态（0x2021）")
+            return
+
+        def field(sub: int, default: int = 0) -> int:
+            return int(values.get((0x2021, sub), default))
+
+        flags = field(0x02)
+        self.safety_vars["state"].set(mcu_state_name(field(0x01)))
+        self.safety_vars["flags"].set(f"0x{flags:04X} {safety_flags_text(flags)}")
+        self.safety_vars["fw"].set(format_version(field(0x03)))
+        self.safety_vars["proto"].set(format_version(field(0x06)))
+        self.safety_vars["fault"].set(fault_code_name(field(0x04)))
+        self.safety_vars["stop"].set(stop_kind_name(field(0x05)))
+        self.safety_vars["snap_code"].set(fault_code_name(field(0x07)))
+        self.safety_vars["snap_time"].set(f"{field(0x08)} ms")
+        self.safety_vars["snap_vbus"].set(f"{field(0x09)} mV")
+        self.safety_vars["snap_rpm"].set(f"{field(0x0A)} rpm")
+        self.safety_vars["snap_iq"].set(f"{field(0x0B)} mA")
+        self.safety_vars["snap_pos"].set(f"{field(0x0C)} count")
+        self.safety_vars["snap_mode"].set(str(field(0x0D)))
+
+        if flags & (1 << 6):
+            self.error_style_var.set("急停锁存中：请执行清错 (0xF1 0x12) 后重新使能")
+            self.error_label.configure(style="Bad.TLabel")
+        elif flags & (1 << 4):
+            self.error_style_var.set("通讯失联保护已触发：从机已受控停车并下使能")
+            self.error_label.configure(style="Warn.TLabel")
+
     def _handle_service_result(self, response: object) -> None:
         self.service_result_var.set(response.summary)
         self.service_result_label.configure(foreground="#157A36" if response.ok else "#B3261E")
@@ -1046,10 +1242,15 @@ class MotorHostApp(tk.Tk):
             filtered = self.filters.apply_int("max_speed", int(response.value))
             self.max_speed_rpm = filtered
             self.max_speed_var.set(f"{filtered} rpm")
+        elif key == (0x2020, 0x03):
+            self.control_timeout_ms = int(response.value)
+            self.control_timeout_var.set(f"{self.control_timeout_ms} ms")
+            self.param_vars[key].set(str(self.control_timeout_ms))
         elif key in self.param_vars:
-            self.param_vars[key].set(str(response.value))
+            value = decode_did_value(response.did, response.sub_id, int(response.value))
+            self.param_vars[key].set(str(value))
             spec = DID_BY_KEY[key]
-            self.param_value_labels[key].set(f"回读 {response.value} {spec.unit}".strip())
+            self.param_value_labels[key].set(f"回读 {value} {spec.unit}".strip())
 
     # ------------------------------------------------------------------ 事件泵
 
@@ -1081,6 +1282,8 @@ class MotorHostApp(tk.Tk):
             self._read_uid()
             self._read_did(0x6073, 0x00)
             self._read_did(0x607F, 0x00)
+            self._read_did(0x2020, 0x03)
+            self._read_safety()
 
     def _drain_events(self) -> None:
         try:
@@ -1121,6 +1324,8 @@ class MotorHostApp(tk.Tk):
                     self._update_device(payload)
                 elif kind == "telemetry":
                     self._update_telemetry(payload)
+                elif kind == "safety":
+                    self._update_safety(payload)
                 elif kind == "service":
                     self._handle_service_result(payload)
                 elif kind == "raw_reply":

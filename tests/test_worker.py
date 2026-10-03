@@ -124,6 +124,39 @@ class WorkerEndToEndTests(WorkerHarness):
         self.assertTrue(response.ok)
         self.assertEqual(response.did, 0x1011)
 
+    def test_stop_services_return_ok(self) -> None:
+        self.worker.submit("stop")
+        response = self._wait_for("service")
+        self.assertTrue(response.ok)
+        self.assertEqual(response.sub_id, 0x13)
+        self.worker.submit("quick_stop")
+        response = self._wait_for("service")
+        self.assertTrue(response.ok)
+        self.assertEqual(response.sub_id, 0x14)
+
+    def test_emergency_stop_latches_until_clear_fault(self) -> None:
+        self.worker.submit("emergency_stop")
+        response = self._wait_for("service")
+        self.assertTrue(response.ok)
+        self.assertEqual(response.sub_id, 0x15)
+
+        self.worker.submit("motor_enable", True)
+        refused = self._wait_for("service")
+        self.assertFalse(refused.ok)
+        self.assertEqual(refused.return_code, 0xE5)
+
+        self.worker.submit("clear_fault")
+        self.assertTrue(self._wait_for("service").ok)
+        self.worker.submit("motor_enable", True)
+        self.assertTrue(self._wait_for("service").ok)
+
+    def test_read_safety_emits_values(self) -> None:
+        self.worker.submit("read_safety")
+        values = self._wait_for("safety", timeout=5.0)
+        self.assertEqual(values[(0x2021, 0x03)], 0x00021003)
+        self.assertEqual(values[(0x2021, 0x06)], 0x00010400)
+        self.assertIn((0x2021, 0x02), values)
+
     def test_read_telemetry(self) -> None:
         self.worker.transport._zero_established = True
         self.worker.submit("send_control", MotorControl(True, 1, 0, 50, 100))

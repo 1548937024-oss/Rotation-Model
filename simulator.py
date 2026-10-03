@@ -16,12 +16,17 @@ import threading
 import time
 
 from motor_protocol import (
+    CONTROL_TIMEOUT_DEFAULT_MS,
+    CONTROL_TIMEOUT_MAX_MS,
+    CONTROL_TIMEOUT_MIN_MS,
     DEFAULT_BAUDRATE,
     HEADER,
     MAX_IQ_MA,
     MAX_SPEED_RPM,
     ALIGNMENT_TIME_S,
     MotorControl,
+    POSITION_SOFT_MAX_COUNTS,
+    POSITION_SOFT_MIN_COUNTS,
     build_reply_tail,
     parse_full_frame,
 )
@@ -30,6 +35,10 @@ ABORT_READ_NOT_ALLOWED = 0x06010001
 ABORT_WRITE_NOT_ALLOWED = 0x06010002
 ABORT_DID_NOT_EXIST = 0x06020000
 ABORT_VALUE_OUT_OF_RANGE = 0x06090030
+
+# 与 board_conf.h 的 BOARD_FW_VERSION_U32 / BOARD_PROTO_VERSION_U32 一致
+BOARD_FW_VERSION = 0x00021003
+BOARD_PROTO_VERSION = 0x00010400
 
 
 class SimulatedTransport:
@@ -64,6 +73,24 @@ class SimulatedTransport:
         self._apply_after: float | None = None
         self._pending_service = bytes(8)
         self._last_control: MotorControl | None = None
+        # 安全保护 / 停车 / 通讯看门狗状态
+        self._safety_latched = False
+        self._comm_lost = False
+        self._stop_active = False
+        self._stop_kind = 0
+        self._stop_deadline = 0.0
+        self._last_cmd_time = time.monotonic()
+        self._start_time = time.monotonic()
+        self._pos_inband = True
+        self._snapshot: dict[str, int] = {
+            "code": 0, "time_ms": 0, "vbus_mv": 0, "rpm": 0, "iq_ma": 0, "pos": 0, "mode": 0,
+        }
+        # 0x2020 安全配置
+        self._safe_cfg: dict[str, int] = {
+            "pos_min": POSITION_SOFT_MIN_COUNTS,
+            "pos_max": POSITION_SOFT_MAX_COUNTS,
+            "ctrl_timeout_ms": CONTROL_TIMEOUT_DEFAULT_MS,
+        }
 
         self._writable: dict[tuple[int, int], int] = {
             (0x6073, 0x01): 1500,
@@ -94,10 +121,57 @@ class SimulatedTransport:
     def inject_fault(self, code: int = 3) -> None:
         self.error_code = int(code)
         self.enabled = False
+        self._stop_active = False
+        self.speed = 0
+        self.iq = 0
+        self._record_snapshot(code)
+
+    # ------------------------------------------------------------- 内部状态推进
+
+    def _mark_alive(self) -> None:
+        """记录一次合法控制帧（Control1 或 0xF1），用于控制帧超时保护。"""
+
+        self._last_cmd_time = time.monotonic()
+
+    def _record_snapshot(self, code: int) -> None:
+        self._snapshot = {
+            "code": int(code),
+            "time_ms": int((time.monotonic() - self._start_time) * 1000),
+            "vbus_mv": self.voltage_mv,
+            "rpm": int(self.speed * MAX_SPEED_RPM / 100),
+            "iq_ma": int(self.iq * MAX_IQ_MA / 100),
+            "pos": int(self.encoder_total),
+            "mode": int(self.mode),
+        }
+
+    def _begin_stop(self, kind: int) -> None:
+        """kind: 1 = 正常停车（先减速），2 = 快速/急停（立即断开）。"""
+
+        self._stop_kind = int(kind)
+        if kind == 1 and self.enabled and self._align_until is None:
+            if self._stop_active:
+                return
+            self._stop_active = True
+            self._stop_deadline = time.monotonic() + 1.5
+            self.target_speed = 0
+            self.target_position = int(self.position)
+            return
+        self.enabled = False
+        self._stop_active = False
+        self._align_until = None
+        self._apply_after = None
         self.speed = 0
         self.iq = 0
 
-    # ------------------------------------------------------------- 内部状态推进
+    def _watchdog_tick(self, now: float) -> None:
+        """控制帧超时：使能后超时未收到合法控制帧，则受控停车并下使能。"""
+
+        if not self.enabled or self._stop_active or self._align_until is not None:
+            return
+        timeout = int(self._safe_cfg["ctrl_timeout_ms"])
+        if timeout and (now - self._last_cmd_time) * 1000.0 >= timeout:
+            self._comm_lost = True
+            self._begin_stop(1)
 
     def _advance(self) -> None:
         now = time.monotonic()
@@ -110,10 +184,25 @@ class SimulatedTransport:
                 self._zero_established = True
                 self._apply_after = now + 0.02
                 self.position = 0.0
+                self._mark_alive()
             else:
                 self.speed = 0
                 self.iq = min(18, int(250 * 100 / MAX_IQ_MA))  # 对齐电流约 250 mA
                 return
+
+        self._watchdog_tick(now)
+
+        if self._stop_active:
+            if (not self.enabled) or abs(self.speed) <= 1 or now >= self._stop_deadline:
+                self.enabled = False
+                self._stop_active = False
+                self.speed = 0
+                self.iq = 0
+                return
+            self.target_speed = 0
+            self.speed = int(self.speed * 0.5)
+            self.iq = 0
+            return
 
         if self._apply_after is not None:
             if now < self._apply_after:
@@ -139,6 +228,9 @@ class SimulatedTransport:
             self.speed = int(max(-100, min(100, step / max(dt, 1e-6) / 35.0)))
             if abs(delta) < 1:
                 self.speed = 0
+                self._pos_inband = True
+            else:
+                self._pos_inband = False
         else:
             self.speed = max(-100, min(100, self.target_speed))
             self.position = (self.position + self.speed * 16.0 * dt) % 65536
@@ -149,6 +241,17 @@ class SimulatedTransport:
         self.encoder_z = abs(self.encoder_total) // 4096
         peak = int(MAX_IQ_MA * self.iq / 100)
         self.phase_currents = (peak, -peak // 2, -peak // 2)
+
+    def _mcu_state(self) -> int:
+        if self._stop_active:
+            return 6
+        if self.error_code:
+            return 4
+        if self._align_until is not None:
+            return 2
+        if self.enabled:
+            return 3
+        return 0
 
     def _query_reply(self, mid: int) -> bytes | None:
         if mid == 0x180 + self.node_id:
@@ -194,7 +297,60 @@ class SimulatedTransport:
             return self.encoder_total & 0xFFFFFFFF
         if key == (0x2015, 0x02):
             return self.encoder_z & 0xFFFFFFFF
+        if did == 0x2020:
+            if sub == 0x01:
+                return self._safe_cfg["pos_min"] & 0xFFFFFFFF
+            if sub == 0x02:
+                return self._safe_cfg["pos_max"] & 0xFFFFFFFF
+            if sub == 0x03:
+                return self._safe_cfg["ctrl_timeout_ms"]
+        if did == 0x2021:
+            snapshot = self._snapshot
+            if sub == 0x01:
+                return self._mcu_state()
+            if sub == 0x02:
+                return self._safety_flags()
+            if sub == 0x03:
+                return BOARD_FW_VERSION
+            if sub == 0x04:
+                return self.error_code & 0xFFFF
+            if sub == 0x05:
+                return self._stop_kind & 0xFFFF
+            if sub == 0x06:
+                return BOARD_PROTO_VERSION
+            if sub == 0x07:
+                return snapshot["code"] & 0xFFFF
+            if sub == 0x08:
+                return snapshot["time_ms"] & 0xFFFFFFFF
+            if sub == 0x09:
+                return snapshot["vbus_mv"] & 0xFFFFFFFF
+            if sub == 0x0A:
+                return snapshot["rpm"] & 0xFFFFFFFF
+            if sub == 0x0B:
+                return snapshot["iq_ma"] & 0xFFFFFFFF
+            if sub == 0x0C:
+                return snapshot["pos"] & 0xFFFFFFFF
+            if sub == 0x0D:
+                return snapshot["mode"] & 0xFFFF
         return None
+
+    def _safety_flags(self) -> int:
+        flags = 0
+        if self._zero_established:
+            flags |= 0x0001
+        if self._pos_inband:
+            flags |= 0x0002
+        if self.error_code or self._safety_latched:
+            flags |= 0x0004
+        if self.enabled:
+            flags |= 0x0008
+        if self._comm_lost:
+            flags |= 0x0010
+        if self._stop_active:
+            flags |= 0x0020
+        if self._safety_latched:
+            flags |= 0x0040
+        return flags
 
     def _reply_service(self, data: bytes) -> None:
         """按固件行为：服务应答在收完请求后立即主动下发，主机无需再查询。"""
@@ -246,7 +402,35 @@ class SimulatedTransport:
                     bytes((0x60, did & 0xFF, (did >> 8) & 0xFF, sub, 0, 0, 0, 0))
                 )
                 return
-            if (did, sub) in ((0x6073, 0x00), (0x607F, 0x00), (0x1018, 0x04), (0x3001, 0x01)) or did in (0x2010, 0x2015):
+            if did == 0x2020:
+                # 安全配置：仅停机可写，且有交叉约束
+                if self.enabled or self._align_until is not None or self._stop_active:
+                    self._abort(did, sub, ABORT_WRITE_NOT_ALLOWED)
+                    return
+                signed_value = value - 0x100000000 if value & 0x80000000 else value
+                if sub == 0x01:
+                    if signed_value < POSITION_SOFT_MIN_COUNTS or signed_value >= self._safe_cfg["pos_max"]:
+                        self._abort(did, sub, ABORT_VALUE_OUT_OF_RANGE)
+                        return
+                    self._safe_cfg["pos_min"] = signed_value
+                elif sub == 0x02:
+                    if signed_value > POSITION_SOFT_MAX_COUNTS or signed_value <= self._safe_cfg["pos_min"]:
+                        self._abort(did, sub, ABORT_VALUE_OUT_OF_RANGE)
+                        return
+                    self._safe_cfg["pos_max"] = signed_value
+                elif sub == 0x03:
+                    if not CONTROL_TIMEOUT_MIN_MS <= value <= CONTROL_TIMEOUT_MAX_MS:
+                        self._abort(did, sub, ABORT_VALUE_OUT_OF_RANGE)
+                        return
+                    self._safe_cfg["ctrl_timeout_ms"] = value
+                else:
+                    self._abort(did, sub, ABORT_DID_NOT_EXIST)
+                    return
+                self._reply_service(
+                    bytes((0x60, did & 0xFF, (did >> 8) & 0xFF, sub)) + value.to_bytes(4, "little")
+                )
+                return
+            if (did, sub) in ((0x6073, 0x00), (0x607F, 0x00), (0x1018, 0x04), (0x3001, 0x01)) or did in (0x2010, 0x2015, 0x2021):
                 self._abort(did, sub, ABORT_WRITE_NOT_ALLOWED)
                 return
             if (did, sub) not in self._writable:
@@ -267,6 +451,7 @@ class SimulatedTransport:
 
     def _handle_service(self, data: bytes) -> None:
         sid = data[0]
+        self._mark_alive()
         if sid in (0x23, 0x40):
             self._handle_did(data)
             return
@@ -278,29 +463,38 @@ class SimulatedTransport:
                 if value not in (0, 1):
                     return_code = 0xE5
                 elif value == 1:
-                    self.error_code = 0
-                    self.enabled = True
-                    if not self._zero_established:
-                        self._align_until = time.monotonic() + ALIGNMENT_TIME_S
+                    if self._safety_latched or self._stop_active or self.enabled:
+                        return_code = 0xE5
                     else:
-                        self._apply_after = time.monotonic() + 0.02
+                        self.error_code = 0
+                        self.enabled = True
+                        self._stop_kind = 0
+                        if not self._zero_established:
+                            self._align_until = time.monotonic() + ALIGNMENT_TIME_S
+                        else:
+                            self._apply_after = time.monotonic() + 0.02
                 else:
-                    self.enabled = False
-                    self._align_until = None
-                    self._apply_after = None
+                    self._begin_stop(2)
             elif sub_function == 0x11:
-                if self.enabled:
+                if self.enabled or self._safety_latched or self._stop_active:
                     return_code = 0xE5
                 elif value not in (0, 1):
                     return_code = 0xE5
                 else:
                     self.mode = value
             elif sub_function == 0x12:
-                self.enabled = False
-                self._align_until = None
-                self._apply_after = None
+                self._safety_latched = False
+                self._comm_lost = False
+                self._begin_stop(2)
                 time.sleep(0.004)
                 self.error_code = 0
+            elif sub_function == 0x13:
+                self._begin_stop(1)
+            elif sub_function == 0x14:
+                self._begin_stop(2)
+            elif sub_function == 0x15:
+                self._safety_latched = True
+                self._begin_stop(2)
             elif sub_function == 0xA2:
                 self._abort(0x0000, 0xA2, ABORT_DID_NOT_EXIST)
                 return
@@ -319,29 +513,37 @@ class SimulatedTransport:
     # ------------------------------------------------------------- 控制报文
 
     def _apply_control(self, control: MotorControl) -> None:
+        self._mark_alive()
         now = time.monotonic()
-        if control.enable:
-            if not self.enabled:
-                self.enabled = True
-                self.mode = control.mode
-                if not self._zero_established:
-                    self._align_until = now + ALIGNMENT_TIME_S
-                else:
-                    self._apply_after = now + 0.02
-            elif control.mode != self.mode:
-                self.enabled = False
-                self.mode = control.mode
-                self.enabled = True
-                self._apply_after = now + 0.02
-            self.target_position = control.target_position
-            self.target_speed = control.target_speed
-            self.target_iq = control.target_iq
-        else:
+        if not control.enable:
             self.enabled = False
             self._align_until = None
             self._apply_after = None
             self.speed = 0
             self.iq = 0
+            self._last_control = control
+            return
+        if self._safety_latched or self._stop_active:
+            # 急停锁存 / 停车过程中拒绝 Control1 使能
+            self.enabled = False
+            self._last_control = control
+            return
+        if not self.enabled:
+            self.enabled = True
+            self.mode = control.mode
+            self._stop_kind = 0
+            if not self._zero_established:
+                self._align_until = now + ALIGNMENT_TIME_S
+            else:
+                self._apply_after = now + 0.02
+        elif control.mode != self.mode:
+            self.enabled = False
+            self.mode = control.mode
+            self.enabled = True
+            self._apply_after = now + 0.02
+        self.target_position = control.target_position
+        self.target_speed = control.target_speed
+        self.target_iq = control.target_iq
         self._last_control = control
 
     # ------------------------------------------------------------- 传输接口

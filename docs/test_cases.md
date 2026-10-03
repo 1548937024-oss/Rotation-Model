@@ -39,6 +39,14 @@ python -m unittest discover -s tests -v
 | A24 | 错误 DLEN 帧跳过 | 收到 Status2 帧后再给 Status1，能跳过不匹配帧 | `test_worker.WorkerFramingTests` |
 | A25 | 丢应答自动重试 | 首次无应答、第二次应答可成功；三次都失败才报超时 | `test_worker.WorkerFramingTests` |
 | A26 | 服务应答为主动下发 | 延迟 30 ms 的后置应答仍成功，且全程只发 0x601、不发 0x581 查询 | `test_worker.WorkerFramingTests` |
+| A27 | 停车服务帧 | 0xF1 0x13/0x14/0x15 三帧逐字节一致 | `test_protocol.StopServiceTests` |
+| A28 | 正常/快速停车 | 正常停车先减速再下使能；快速停车立即断开 | `test_simulator` |
+| A29 | 急停锁存与恢复 | 0x15 后使能被拒（0xE5），0x12 清错后可重新使能 | `test_simulator` / `test_worker` |
+| A30 | 控制帧超时保护 | 超时未收到控制帧 → 受控停车、下使能、bit4 置位 | `test_simulator` |
+| A31 | 控制帧续命 | 超时窗口内发一帧 Control1 即保持使能、不触发失联 | `test_simulator` |
+| A32 | 安全配置 0x2020 | 读写、越界拒绝、软限位交叉约束、运行中拒写 | `test_simulator` / `test_protocol` |
+| A33 | 安全状态 0x2021 | 读到状态机/标志/固件版本 V2.10.3/协议版本 V1.4.0 | `test_simulator` / `test_worker` |
+| A34 | 安全量格式化 | 版本 BCD、状态名、标志位文案、停车类型 | `test_protocol.SafetyConfigTests` |
 
 ## B 组：实机联调（需硬件）
 
@@ -64,6 +72,11 @@ python -m unittest discover -s tests -v
 | B16 | 上电瞬间连接，观察前 3 s | 启动窗口内若出现接收错位，日志记录重同步字节数，不弹非法 DLEN 错误 |
 | B17 | 连接后立即连续点击查询/读参数 | 发请求前清输入缓冲，不出现上一帧残留串扰 |
 | B18 | 读取 UID / Max Iq / Max Speed 各连续 20 次 | 全部返回，无 "read_did 失败"；日志中只出现 0x601 请求与 0x581 应答尾 |
+| B19 | 上使能后故意不发任何控制帧 | 约 200 ms 后受控停车并下使能；0x2021/02 bit4 置位 |
+| B20 | 点击“急停并锁存”后再点“上使能” | 使能被拒（0xE5）；清错后重新使能成功 |
+| B21 | 写 0x2020/01、02 软限位并保存、重载 | 写成功后回读一致；最小/最大顺序错误被拒（0x06090030） |
+| B22 | 运行中写 0x2020 | 返回 Abort 0x06010002（仅停机可写） |
+| B23 | 读取 0x2021 全部子项 | 状态机/标志/版本/故障快照有合理值，V2.10.3 / V1.4.0 |
 
 ## C 组：异常与边界
 

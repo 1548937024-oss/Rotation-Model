@@ -3,18 +3,24 @@ from __future__ import annotations
 import unittest
 
 from motor_protocol import (
+    CONTROL_TIMEOUT_DEFAULT_MS,
     DEFAULT_BAUDRATE,
     DID_BY_KEY,
     MAX_IQ_MA,
     MAX_SPEED_RPM,
+    POSITION_SOFT_MAX_COUNTS,
+    POSITION_SOFT_MIN_COUNTS,
     MotorControl,
     ProtocolError,
     build_clear_fault_service,
+    build_emergency_stop_service,
     build_frame,
     build_group_control_frame,
     build_motor_enable_service,
     build_multi_control_frame,
+    build_normal_stop_service,
     build_query_frame,
+    build_quick_stop_service,
     build_read_did,
     build_reload_parameters,
     build_reply_tail,
@@ -23,11 +29,17 @@ from motor_protocol import (
     build_write_did,
     crc8,
     decode_did_value,
+    fault_code_name,
+    format_did_value,
+    format_version,
+    mcu_state_name,
     parse_device_status,
     parse_full_frame,
     parse_motion_status,
     parse_reply_tail,
     parse_service_response,
+    safety_flags_text,
+    stop_kind_name,
 )
 
 
@@ -270,6 +282,75 @@ class GroupControlTests(unittest.TestCase):
             build_multi_control_frame({})
         with self.assertRaises(ProtocolError):
             build_multi_control_frame({0: MotorControl(False, 0, 0, 0, 0)})
+
+
+class StopServiceTests(unittest.TestCase):
+    """0xF1 0x13 / 0x14 / 0x15 停车服务的线上帧。"""
+
+    def test_stop_service_frames(self) -> None:
+        self.assertEqual(
+            build_frame(0x601, build_normal_stop_service()),
+            bytes.fromhex("AA 01 06 08 F1 13 01 00 00 00 00 00 9B"),
+        )
+        self.assertEqual(
+            build_frame(0x601, build_quick_stop_service()),
+            bytes.fromhex("AA 01 06 08 F1 14 01 00 00 00 00 00 88"),
+        )
+        self.assertEqual(
+            build_frame(0x601, build_emergency_stop_service()),
+            bytes.fromhex("AA 01 06 08 F1 15 01 00 00 00 00 00 57"),
+        )
+
+
+class SafetyConfigTests(unittest.TestCase):
+    def test_did_catalog_entries(self) -> None:
+        for key in ((0x2020, 0x01), (0x2020, 0x02), (0x2020, 0x03)):
+            self.assertTrue(DID_BY_KEY[key].writable)
+        for sub in range(0x01, 0x0E):
+            self.assertFalse(DID_BY_KEY[(0x2021, sub)].writable)
+
+    def test_control_timeout_bounds(self) -> None:
+        spec = DID_BY_KEY[(0x2020, 0x03)]
+        self.assertEqual(
+            (spec.minimum, spec.maximum, spec.default),
+            (20, 5000, CONTROL_TIMEOUT_DEFAULT_MS),
+        )
+
+    def test_soft_limit_defaults(self) -> None:
+        self.assertEqual(DID_BY_KEY[(0x2020, 0x01)].default, POSITION_SOFT_MIN_COUNTS)
+        self.assertEqual(DID_BY_KEY[(0x2020, 0x02)].default, POSITION_SOFT_MAX_COUNTS)
+
+    def test_signed_soft_limit_decode(self) -> None:
+        self.assertEqual(
+            decode_did_value(0x2020, 0x01, POSITION_SOFT_MIN_COUNTS & 0xFFFFFFFF),
+            POSITION_SOFT_MIN_COUNTS,
+        )
+        self.assertEqual(
+            decode_did_value(0x2020, 0x02, POSITION_SOFT_MAX_COUNTS),
+            POSITION_SOFT_MAX_COUNTS,
+        )
+
+    def test_snapshot_signed_decode(self) -> None:
+        self.assertEqual(decode_did_value(0x2021, 0x0A, (-4000) & 0xFFFFFFFF), -4000)
+        self.assertEqual(decode_did_value(0x2021, 0x0B, (-250) & 0xFFFFFFFF), -250)
+        self.assertEqual(decode_did_value(0x2021, 0x08, 123456), 123456)
+
+    def test_version_formatting(self) -> None:
+        self.assertEqual(format_version(0x00021003), "V2.10.3")
+        self.assertEqual(format_version(0x00010400), "V1.4.0")
+
+    def test_state_and_flag_helpers(self) -> None:
+        self.assertEqual(mcu_state_name(3), "RUN 运行")
+        self.assertIn("急停锁存", safety_flags_text(0x0040))
+        self.assertEqual(safety_flags_text(0), "无")
+        self.assertEqual(stop_kind_name(1), "正常停车")
+        self.assertEqual(fault_code_name(0), "无故障")
+        self.assertIn("速度失控", fault_code_name(4))
+
+    def test_format_did_value_specials(self) -> None:
+        self.assertEqual(format_did_value(0x2021, 0x03, 0x00021003), "V2.10.3")
+        self.assertIn("RUN", format_did_value(0x2021, 0x01, 3))
+        self.assertIn("急停锁存", format_did_value(0x2021, 0x02, 0x0040))
 
 
 if __name__ == "__main__":
