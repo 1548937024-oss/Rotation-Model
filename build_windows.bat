@@ -4,19 +4,26 @@ setlocal
 cd /d "%~dp0"
 
 echo ========================================
-echo   电机模组上位机 Windows EXE 构建程序
+echo   MicroDriver 外置驱动器上位机 EXE 构建
 echo ========================================
 echo.
 
+set "PY_CMD=py -3"
 where py >nul 2>&1
-if errorlevel 1 (
+if not errorlevel 1 goto have_python
+
+set "PY_CMD="
+if exist "%LOCALAPPDATA%\Programs\Python\Python312\python.exe" set "PY_CMD=%LOCALAPPDATA%\Programs\Python\Python312\python.exe"
+if exist "%LOCALAPPDATA%\Programs\Python\Python311\python.exe" set "PY_CMD=%LOCALAPPDATA%\Programs\Python\Python311\python.exe"
+if not defined PY_CMD (
   echo [失败] 未检测到 Python。
   echo 请安装 Python 3.11 或 3.12，并在安装时勾选 Add Python to PATH。
   pause
   exit /b 1
 )
 
-py -3 -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)"
+:have_python
+%PY_CMD% -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)"
 if errorlevel 1 (
   echo [失败] Python 版本过低，需要 Python 3.11 或更高版本。
   pause
@@ -25,7 +32,7 @@ if errorlevel 1 (
 
 if not exist ".venv-build\Scripts\python.exe" (
   echo [1/5] 创建独立构建环境...
-  py -3 -m venv .venv-build
+  %PY_CMD% -m venv .venv-build
   if errorlevel 1 goto :failed
 )
 
@@ -41,27 +48,27 @@ python -m unittest discover -s tests -v
 if errorlevel 1 goto :failed
 
 echo [4/5] 生成单文件 Windows EXE...
-python -m PyInstaller --noconfirm --clean motor_module_host.spec
+python -m PyInstaller --noconfirm --clean microdriver_host.spec
 if errorlevel 1 goto :failed
 
-if not exist "dist\电机模组上位机.exe" (
+if not exist "dist\外置驱动器上位机.exe" (
   echo [失败] PyInstaller 未生成目标 EXE。
   goto :failed
 )
 
 if not exist "release" mkdir "release"
-copy /Y "dist\电机模组上位机.exe" "release\电机模组上位机.exe" >nul
+copy /Y "dist\外置驱动器上位机.exe" "release\外置驱动器上位机.exe" >nul
 copy /Y "README.md" "release\README.md" >nul
 
 echo [5/5] 计算文件校验值...
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$h=(Get-FileHash -Algorithm SHA256 'release\电机模组上位机.exe').Hash; Set-Content -Encoding ASCII 'release\SHA256.txt' ('SHA256  电机模组上位机.exe  '+$h); Write-Host ('SHA256: '+$h)"
+  "$h=(Get-FileHash -Algorithm SHA256 'release\外置驱动器上位机.exe').Hash; Set-Content -Encoding ASCII 'release\SHA256.txt' ('SHA256  外置驱动器上位机.exe  '+$h); Write-Host ('SHA256: '+$h)"
 if errorlevel 1 goto :failed
 
 echo.
 echo ========================================
 echo 构建完成
-echo EXE：release\电机模组上位机.exe
+echo EXE：release\外置驱动器上位机.exe
 echo 校验：release\SHA256.txt
 echo ========================================
 explorer "release"

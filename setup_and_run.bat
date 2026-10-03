@@ -4,11 +4,18 @@ cd /d "%~dp0"
 
 if exist ".venv\Scripts\python.exe" goto install_deps
 
+set "PY_CMD=py -3"
 where py >nul 2>&1
-if errorlevel 1 goto no_python
+if not errorlevel 1 goto have_python
 
+set "PY_CMD="
+if exist "%LOCALAPPDATA%\Programs\Python\Python312\python.exe" set "PY_CMD=%LOCALAPPDATA%\Programs\Python\Python312\python.exe"
+if exist "%LOCALAPPDATA%\Programs\Python\Python311\python.exe" set "PY_CMD=%LOCALAPPDATA%\Programs\Python\Python311\python.exe"
+if not defined PY_CMD goto no_python
+
+:have_python
 echo Creating the local Python environment...
-py -3 -m venv ".venv"
+%PY_CMD% -m venv ".venv"
 if errorlevel 1 goto failed
 
 :install_deps
